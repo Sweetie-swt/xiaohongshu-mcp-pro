@@ -24,6 +24,12 @@ type XiaohongshuService struct {
 	// creatorLoginBrowser/Page 用于 creator 手机号登录流程（跨两次 MCP 调用）
 	creatorLoginBrowser *browser.ProfileBrowser
 	creatorLoginPage    *rod.Page
+
+	// 以下函数仅用于隔离 creator 登录流程的单元测试；生产环境保持 nil，走真实实现。
+	creatorVerifyOTPFunc          func(*rod.Page, string) (*xiaohongshu.OTPVerificationResult, error)
+	creatorWaitSecurityVerifyFunc func(*rod.Page, time.Duration) error
+	creatorFinalizeLoginFunc      func(*rod.Page) error
+	creatorCloseLoginSessionFunc  func(*browser.ProfileBrowser, *rod.Page)
 }
 
 // NewXiaohongshuService 创建小红书服务实例
@@ -616,12 +622,7 @@ type CreatorPhoneLoginResponse struct {
 func (s *XiaohongshuService) CreatorPhoneLogin(phone string) (*CreatorPhoneLoginResponse, error) {
 	// 关闭上一次未完成的 creator 登录浏览器
 	if s.creatorLoginBrowser != nil {
-		if s.creatorLoginPage != nil {
-			_ = s.creatorLoginPage.Close()
-		}
-		s.creatorLoginBrowser.Close()
-		s.creatorLoginBrowser = nil
-		s.creatorLoginPage = nil
+		s.releaseCreatorLoginSession(s.creatorLoginBrowser, s.creatorLoginPage)
 	}
 
 	b := newProfileBrowser()
@@ -680,7 +681,8 @@ func shouldRetainCreatorLoginSession(result *xiaohongshu.OTPSendResult, sendErr 
 
 // CreatorVerifyOTPResult creator 验证码登录结果
 type CreatorVerifyOTPResult struct {
-	// SecurityQRShot 非 nil 时表示小红书弹出了安全验证弹窗，已等待用户扫码并成功
+	Status xiaohongshu.OTPVerificationStatus `json:"status"`
+	// SecurityQRShot 非 nil 时表示小红书弹出了安全验证弹窗，等待用户扫码。
 	SecurityQRShot []byte
 }
 
@@ -692,15 +694,71 @@ func (s *XiaohongshuService) CreatorVerifyOTP(otp string) (*CreatorVerifyOTPResu
 
 	b := s.creatorLoginBrowser
 	page := s.creatorLoginPage
-	s.creatorLoginBrowser = nil
-	s.creatorLoginPage = nil
-	defer b.Close()
-	defer page.Close()
-
-	action := xiaohongshu.NewCreatorLogin(page)
-	qrShot, err := action.VerifyOTP(otp)
+	verification, err := s.verifyCreatorOTP(page, otp)
 	if err != nil {
+		s.releaseCreatorLoginSession(b, page)
 		return nil, err
+	}
+	if verification == nil {
+		s.releaseCreatorLoginSession(b, page)
+		return nil, fmt.Errorf("creator 验证码登录未返回有效状态")
+	}
+	if verification.Status == xiaohongshu.OTPVerificationSecurityVerificationNeeded {
+		// 安全验证是可继续的中间状态：保留 browser/page 给下一次 MCP 调用。
+		return &CreatorVerifyOTPResult{
+			Status:         verification.Status,
+			SecurityQRShot: verification.SecurityVerificationQR,
+		}, nil
+	}
+
+	if err := s.finalizeCreatorLogin(page); err != nil {
+		s.releaseCreatorLoginSession(b, page)
+		return nil, err
+	}
+	s.releaseCreatorLoginSession(b, page)
+	return &CreatorVerifyOTPResult{Status: xiaohongshu.OTPVerificationSucceeded}, nil
+}
+
+// CreatorCompleteSecurityVerification 等待安全验证扫码完成，并复用 creator 登录成功收尾逻辑。
+func (s *XiaohongshuService) CreatorCompleteSecurityVerification() (*CreatorVerifyOTPResult, error) {
+	if s.creatorLoginPage == nil || s.creatorLoginBrowser == nil {
+		return nil, fmt.Errorf("没有活跃的 creator 登录会话，请先调用 creator_phone_login 和 creator_verify_otp")
+	}
+
+	b := s.creatorLoginBrowser
+	page := s.creatorLoginPage
+	if err := s.waitForCreatorSecurityVerification(page, 120*time.Second); err != nil {
+		logrus.Warnf("creator 安全验证未完成，清理临时登录会话: %v", err)
+		s.releaseCreatorLoginSession(b, page)
+		return nil, err
+	}
+	if err := s.finalizeCreatorLogin(page); err != nil {
+		s.releaseCreatorLoginSession(b, page)
+		return nil, err
+	}
+	s.releaseCreatorLoginSession(b, page)
+	return &CreatorVerifyOTPResult{Status: xiaohongshu.OTPVerificationSucceeded}, nil
+}
+
+func (s *XiaohongshuService) verifyCreatorOTP(page *rod.Page, otp string) (*xiaohongshu.OTPVerificationResult, error) {
+	if s.creatorVerifyOTPFunc != nil {
+		return s.creatorVerifyOTPFunc(page, otp)
+	}
+	return xiaohongshu.NewCreatorLogin(page).VerifyOTP(otp)
+}
+
+func (s *XiaohongshuService) waitForCreatorSecurityVerification(page *rod.Page, timeout time.Duration) error {
+	if s.creatorWaitSecurityVerifyFunc != nil {
+		return s.creatorWaitSecurityVerifyFunc(page, timeout)
+	}
+	return xiaohongshu.NewCreatorLogin(page).WaitForSecurityVerification(timeout)
+}
+
+// finalizeCreatorLogin 是 creator 登录成功后的唯一收尾路径。
+// 它负责 SSO、cookies 保存；ProfileBrowser 关闭由 releaseCreatorLoginSession 统一处理。
+func (s *XiaohongshuService) finalizeCreatorLogin(page *rod.Page) error {
+	if s.creatorFinalizeLoginFunc != nil {
+		return s.creatorFinalizeLoginFunc(page)
 	}
 
 	// 登录成功后跳转到 www.xiaohongshu.com，触发 SSO，让 www session 也写入 profile。
@@ -724,7 +782,26 @@ func (s *XiaohongshuService) CreatorVerifyOTP(otp string) (*CreatorVerifyOTPResu
 	} else {
 		logrus.Info("creator + www session 已保存到 profile 及 cookies.json")
 	}
-	return &CreatorVerifyOTPResult{SecurityQRShot: qrShot}, nil
+	return nil
+}
+
+func (s *XiaohongshuService) releaseCreatorLoginSession(b *browser.ProfileBrowser, page *rod.Page) {
+	if s.creatorLoginBrowser == b {
+		s.creatorLoginBrowser = nil
+	}
+	if s.creatorLoginPage == page {
+		s.creatorLoginPage = nil
+	}
+	if s.creatorCloseLoginSessionFunc != nil {
+		s.creatorCloseLoginSessionFunc(b, page)
+		return
+	}
+	if page != nil {
+		_ = page.Close()
+	}
+	if b != nil {
+		b.Close()
+	}
 }
 
 // encodeBase64 将字节切片编码为 base64 字符串

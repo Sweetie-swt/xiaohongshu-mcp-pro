@@ -589,7 +589,23 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 		}),
 	)
 
-	logrus.Infof("Registered %d MCP tools", 20)
+	// 工具 21: creator 完成安全验证
+	mcp.AddTool(server,
+		&mcp.Tool{
+			Name:        "creator_complete_security_verification",
+			Description: "完成 creator 登录中的安全验证扫码阶段，需先由 creator_verify_otp 返回 security_verification_required",
+			Annotations: &mcp.ToolAnnotations{
+				Title:           "Creator Complete Security Verification",
+				DestructiveHint: boolPtr(false),
+			},
+		},
+		withPanicRecovery("creator_complete_security_verification", func(ctx context.Context, req *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, any, error) {
+			result := appServer.handleCreatorCompleteSecurityVerification(ctx)
+			return convertToMCPResult(result), nil, nil
+		}),
+	)
+
+	logrus.Infof("Registered %d MCP tools", 21)
 }
 
 // convertToMCPResult 将自定义的 MCPToolResult 转换为官方 SDK 的格式

@@ -946,13 +946,41 @@ func (s *AppServer) handleCreatorVerifyOTP(ctx context.Context, otp string) *MCP
 		}
 	}
 
-	// 若经历了安全验证扫码流程，附上截图告知用户
-	if result.SecurityQRShot != nil {
+	if result != nil && result.Status == xiaohongshu.OTPVerificationSecurityVerificationNeeded {
+		response := &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "security_verification_required：需要扫码完成安全验证，登录会话已保留。请查看截图扫码后调用 creator_complete_security_verification。"}},
+		}
+		if result.SecurityQRShot != nil {
+			response.Content = append(response.Content, MCPContent{Type: "image", MimeType: "image/png", Data: encodeBase64(result.SecurityQRShot)})
+		}
+		return response
+	}
+	if result == nil || result.Status != xiaohongshu.OTPVerificationSucceeded {
 		return &MCPToolResult{
-			Content: []MCPContent{
-				{Type: "text", Text: "creator 登录成功（已完成安全验证扫码）。cookies 已保存，现在可以使用 publish_content 发布内容。"},
-				{Type: "image", MimeType: "image/png", Data: encodeBase64(result.SecurityQRShot)},
-			},
+			Content: []MCPContent{{Type: "text", Text: "验证码登录失败：未返回明确成功状态"}},
+			IsError: true,
+		}
+	}
+	return &MCPToolResult{
+		Content: []MCPContent{{Type: "text", Text: "creator 登录成功，cookies 已保存。现在可以使用 publish_content 发布内容。"}},
+	}
+}
+
+// handleCreatorCompleteSecurityVerification 完成 creator 登录中的安全验证扫码阶段。
+func (s *AppServer) handleCreatorCompleteSecurityVerification(ctx context.Context) *MCPToolResult {
+	logrus.Infof("MCP: creator 完成安全验证")
+
+	result, err := s.xiaohongshuService.CreatorCompleteSecurityVerification()
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "安全验证登录失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+	if result == nil || result.Status != xiaohongshu.OTPVerificationSucceeded {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "安全验证登录失败：未返回明确成功状态"}},
+			IsError: true,
 		}
 	}
 	return &MCPToolResult{

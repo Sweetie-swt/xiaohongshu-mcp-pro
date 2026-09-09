@@ -428,11 +428,24 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// OTPVerificationStatus 是 creator 验证码提交阶段的结果状态。
+type OTPVerificationStatus string
+
+const (
+	OTPVerificationSucceeded                  OTPVerificationStatus = "success"
+	OTPVerificationSecurityVerificationNeeded OTPVerificationStatus = "security_verification_required"
+)
+
+// OTPVerificationResult 描述验证码提交后的页面状态。
+// 安全验证状态不是错误：调用方必须保留当前 page，等待用户扫码后再继续。
+type OTPVerificationResult struct {
+	Status                 OTPVerificationStatus
+	SecurityVerificationQR []byte
+}
+
 // VerifyOTP 填写验证码并提交登录。
-// 返回值：(安全验证二维码截图, error)
-// 若小红书弹出"安全验证扫码"弹窗，会将截图返回给调用方展示给用户，
-// 同时在后台等待最多 120 秒直到 web_session 出现（用户扫码后写入）。
-func (a *CreatorLoginAction) VerifyOTP(otp string) ([]byte, error) {
+// 如果页面要求安全验证，立即返回当前截图，不在本次调用中等待扫码。
+func (a *CreatorLoginAction) VerifyOTP(otp string) (*OTPVerificationResult, error) {
 	pp := a.page.Timeout(10 * time.Second)
 
 	// 找到验证码输入框并用 rod 模拟真实键盘输入，确保触发 Vue 响应式
@@ -479,20 +492,135 @@ func (a *CreatorLoginAction) VerifyOTP(otp string) ([]byte, error) {
 
 	// 以 creator 页面离开 /login 为登录成功的信号（比 web_session 更准确）
 	if a.creatorLoginDone() {
-		return nil, nil
+		return &OTPVerificationResult{Status: OTPVerificationSucceeded}, nil
 	}
 
-	// 仍在 /login 页面：说明弹出了安全验证二维码，截图后等待用户扫码（最多 120 秒）
-	shot, _ := a.page.Screenshot(false, nil)
-	logrus.Infof("检测到安全验证弹窗，等待用户扫码（最多 120 秒）")
-	for i := 0; i < 60; i++ {
-		time.Sleep(2 * time.Second)
+	// 仍在 /login 页面时，必须先确认确实出现了安全验证弹窗。
+	if detected, detail := a.securityVerificationVisible(); detected {
+		shot, shotErr := a.page.Screenshot(false, nil)
+		if shotErr != nil {
+			logrus.Warnf("安全验证弹窗截图失败: %v", shotErr)
+		}
+		logrus.Infof("检测到安全验证弹窗，立即返回截图等待用户扫码: %s", detail)
+		return &OTPVerificationResult{
+			Status:                 OTPVerificationSecurityVerificationNeeded,
+			SecurityVerificationQR: shot,
+		}, nil
+	}
+
+	if message := creatorLoginFailureSignal(a.collectOTPPageDiagnostics()); message != "" {
+		return nil, errors.Errorf("creator 登录失败：%s", message)
+	}
+	return nil, errors.New("creator 登录未完成：页面仍在登录页，未检测到安全验证弹窗或明确错误提示")
+}
+
+// WaitForSecurityVerification 等待用户在安全验证弹窗中扫码完成。
+// 登录成功条件沿用 VerifyOTP 使用的 creator 页面离开 /login 判断。
+func (a *CreatorLoginAction) WaitForSecurityVerification(timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 120 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for {
 		if a.creatorLoginDone() {
 			logrus.Infof("扫码验证完成，creator 登录成功")
-			return shot, nil
+			return nil
+		}
+		if message := creatorSecurityFailureSignal(a.collectOTPPageDiagnostics()); message != "" {
+			return errors.Errorf("安全验证失败：%s", message)
+		}
+		if !time.Now().Before(deadline) {
+			return errors.Errorf("安全验证超时（%s），请重新登录", timeout)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// securityVerificationVisible 只把可见的安全验证文案或二维码容器识别为安全验证。
+// 不把“仍在 /login”本身当作安全验证，避免普通登录失败被误判为需要扫码。
+func (a *CreatorLoginAction) securityVerificationVisible() (bool, string) {
+	result, err := a.page.Eval(`() => {
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			const rect = el.getBoundingClientRect();
+			return style.display !== 'none' && style.visibility !== 'hidden' &&
+				style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+		};
+		const text = (el) => (el ? (el.innerText || el.textContent || '') : '')
+			.replace(/\s+/g, ' ').trim();
+		const securityWords = /(安全验证|安全校验|扫码验证|安全二维码|风险验证|security verification|risk verification)/i;
+		const qrWords = /(请扫码|扫描二维码|二维码)/i;
+		const containers = document.querySelectorAll(
+			'[role="dialog"], dialog, [class*="modal"], [class*="dialog"], [class*="security"], [class*="verify"], [class*="qrcode"], [class*="qr-code"], [id*="qrcode"], [id*="qr-code"]'
+		);
+		for (const el of containers) {
+			if (visible(el)) {
+				const value = text(el);
+				if (securityWords.test(value) || qrWords.test(value)) return JSON.stringify({found: true, detail: value.slice(0, 500)});
+			}
+		}
+		const visibleBodyText = text(document.body);
+		if (securityWords.test(visibleBodyText)) {
+			const match = visibleBodyText.match(securityWords);
+			return JSON.stringify({found: true, detail: match ? match[0] : '安全验证文案'});
+		}
+		for (const el of document.querySelectorAll('img, canvas, svg, iframe')) {
+			if (!visible(el)) continue;
+			const parent = el.closest('[role="dialog"], dialog, [class*="modal"], [class*="dialog"], [class*="security"], [class*="verify"], [class*="qrcode"], [class*="qr-code"], [id*="qrcode"], [id*="qr-code"]');
+			if (parent && visible(parent)) {
+				return JSON.stringify({found: true, detail: '可见安全验证容器中的二维码元素'});
+			}
+		}
+		return JSON.stringify({found: false, detail: ''});
+	}`)
+	if err != nil {
+		logrus.Warnf("读取安全验证弹窗状态失败: %v", err)
+		return false, ""
+	}
+	var state struct {
+		Found  bool   `json:"found"`
+		Detail string `json:"detail"`
+	}
+	if err := json.Unmarshal([]byte(result.Value.String()), &state); err != nil {
+		logrus.Warnf("解析安全验证弹窗状态失败: %v", err)
+		return false, ""
+	}
+	return state.Found, state.Detail
+}
+
+func creatorLoginFailureSignal(d otpPageDiagnostics) string {
+	if message := otpErrorSignal(d); message != "" {
+		return message
+	}
+	text := strings.TrimSpace(d.VisiblePageText)
+	for _, marker := range []string{
+		"验证码错误", "验证码不正确", "验证码失效", "登录失败", "登录异常", "手机号不正确",
+	} {
+		if strings.Contains(text, marker) {
+			return marker
 		}
 	}
-	return nil, errors.New("安全验证超时（120 秒），请重新登录")
+	return ""
+}
+
+func creatorSecurityFailureSignal(d otpPageDiagnostics) string {
+	texts := append(append([]string{}, d.VisibleMessages...), d.VisiblePageText)
+	for _, value := range texts {
+		text := strings.TrimSpace(value)
+		if text == "" {
+			continue
+		}
+		for _, marker := range []string{
+			"安全验证失败", "安全校验失败", "验证失败", "二维码已失效", "二维码过期",
+			"登录失败", "登录异常", "操作失败", "验证错误", "风险限制", "暂不支持",
+		} {
+			if strings.Contains(text, marker) {
+				return truncateDiagnosticText(text, 240)
+			}
+		}
+	}
+	return ""
 }
 
 // creatorLoginDone 检查 creator 页面是否已离开 /login（登录完成的信号）
