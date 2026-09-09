@@ -37,11 +37,21 @@ func (a *CreatorLoginAction) NavigateToLogin() ([]byte, error) {
 	return pp.Screenshot(false, nil)
 }
 
+// OTPSendStatus 是手机号验证码发送阶段的三态结果。
+type OTPSendStatus string
+
+const (
+	OTPSendConfirmed OTPSendStatus = "confirmed"
+	OTPSendUncertain OTPSendStatus = "uncertain"
+	OTPSendFailed    OTPSendStatus = "failed"
+)
+
 // OTPSendResult 是手机号验证码发送阶段的页面结果。
-// 即使返回 error，也尽量保留截图和页面诊断对应的消息供调用方展示。
+// uncertain 不等同于失败，调用方应保留当前 creator 登录会话。
 type OTPSendResult struct {
 	Screenshot []byte
 	Message    string
+	Status     OTPSendStatus
 }
 
 type otpPageDiagnostics struct {
@@ -91,6 +101,7 @@ func (a *CreatorLoginAction) SendOTP(phone string) (*OTPSendResult, error) {
 		return &OTPSendResult{
 			Screenshot: shot,
 			Message:    "验证码发送失败：未找到手机号输入框",
+			Status:     OTPSendFailed,
 		}, errors.New("未找到手机号输入框")
 	}
 	time.Sleep(1 * time.Second) // 等待 Vue 响应式更新按钮状态
@@ -106,6 +117,7 @@ func (a *CreatorLoginAction) SendOTP(phone string) (*OTPSendResult, error) {
 		return &OTPSendResult{
 			Screenshot: shot,
 			Message:    "验证码发送失败：" + err.Error(),
+			Status:     OTPSendFailed,
 		}, err
 	}
 
@@ -133,6 +145,7 @@ func (a *CreatorLoginAction) SendOTP(phone string) (*OTPSendResult, error) {
 		return &OTPSendResult{
 			Screenshot: shot,
 			Message:    "验证码发送失败：未找到发送验证码按钮",
+			Status:     OTPSendFailed,
 		}, errors.New("未找到发送验证码按钮")
 	}
 	afterClick := a.collectOTPPageDiagnostics()
@@ -141,19 +154,19 @@ func (a *CreatorLoginAction) SendOTP(phone string) (*OTPSendResult, error) {
 	a.logOTPPageDiagnostics("点击发送验证码后立即", afterClick)
 
 	// 点击只是触发页面行为；必须等待并读取页面反馈，不能把 click 成功当成短信发送成功。
-	final, message, resultErr := a.waitForOTPSendResult(beforeClick)
+	final, status, message, resultErr := a.waitForOTPSendResult(beforeClick)
 	a.logOTPPageDiagnostics("发送验证码结果", final)
 
 	shot, shotErr := pp.Screenshot(false, nil)
 	if shotErr != nil {
 		logrus.Warnf("creator OTP 结果截图失败: %v", shotErr)
 	}
-	if resultErr != nil {
+	if resultErr != nil || status == OTPSendUncertain {
 		saveDebugShot("creator-login-otp-send-result", shot)
-		return &OTPSendResult{Screenshot: shot, Message: message}, resultErr
+		return &OTPSendResult{Screenshot: shot, Message: message, Status: status}, resultErr
 	}
 
-	return &OTPSendResult{Screenshot: shot, Message: message}, nil
+	return &OTPSendResult{Screenshot: shot, Message: message, Status: status}, nil
 }
 
 func (a *CreatorLoginAction) collectOTPPageDiagnostics() otpPageDiagnostics {
@@ -302,15 +315,15 @@ func (a *CreatorLoginAction) ensureCreatorAgreementChecked() error {
 	return nil
 }
 
-func (a *CreatorLoginAction) waitForOTPSendResult(before otpPageDiagnostics) (otpPageDiagnostics, string, error) {
+func (a *CreatorLoginAction) waitForOTPSendResult(before otpPageDiagnostics) (otpPageDiagnostics, OTPSendStatus, string, error) {
 	deadline := time.Now().Add(6 * time.Second)
 	latest := a.collectOTPPageDiagnostics()
 	for {
 		if signal := otpSuccessSignal(latest); signal != "" {
-			return latest, "验证码发送成功：" + signal, nil
+			return latest, OTPSendConfirmed, "验证码已发送，请调用 creator_verify_otp。", nil
 		}
 		if message := otpErrorSignal(latest); message != "" {
-			return latest, "验证码发送失败：" + message, errors.Errorf("页面提示：%s", message)
+			return latest, OTPSendFailed, "验证码发送失败：" + message, errors.Errorf("页面提示：%s", message)
 		}
 		if time.Now().After(deadline) {
 			break
@@ -320,12 +333,12 @@ func (a *CreatorLoginAction) waitForOTPSendResult(before otpPageDiagnostics) (ot
 	}
 
 	if message := otpErrorSignal(latest); message != "" {
-		return latest, "验证码发送失败：" + message, errors.Errorf("页面提示：%s", message)
+		return latest, OTPSendFailed, "验证码发送失败：" + message, errors.Errorf("页面提示：%s", message)
 	}
 	logrus.Warnf("creator OTP 发送状态无法确认：按钮点击前 text=%s，点击后 text=%s，disabled=%t，class=%s",
 		before.SendButtonText, latest.SendButtonText, latest.SendButtonDisabled, latest.SendButtonClass)
-	return latest, "验证码发送状态无法确认：未检测到倒计时、成功文案或明确错误提示",
-		errors.New("验证码发送状态无法确认")
+	return latest, OTPSendUncertain,
+		"验证码发送状态无法从页面确认；登录会话已保留。如果手机实际收到验证码，请继续调用 creator_verify_otp。", nil
 }
 
 func otpSuccessSignal(d otpPageDiagnostics) string {

@@ -637,11 +637,17 @@ func (s *XiaohongshuService) CreatorPhoneLogin(phone string) (*CreatorPhoneLogin
 
 	// 发送验证码
 	otpResult, err := action.SendOTP(phone)
-	if err != nil {
+	if !s.retainCreatorLoginSession(b, page, otpResult, err) {
 		page.Close()
 		b.Close()
 		if otpResult == nil {
+			if err == nil {
+				err = fmt.Errorf("验证码发送失败：未返回有效发送状态")
+			}
 			return nil, err
+		}
+		if err == nil {
+			err = fmt.Errorf("验证码发送失败：状态 %q 不允许保留登录会话", otpResult.Status)
 		}
 		return &CreatorPhoneLoginResponse{
 			Screenshot: fmt.Sprintf("data:image/png;base64,%s", encodeBase64(otpResult.Screenshot)),
@@ -649,14 +655,27 @@ func (s *XiaohongshuService) CreatorPhoneLogin(phone string) (*CreatorPhoneLogin
 		}, err
 	}
 
-	// 保存状态，等待 VerifyOTP 调用
-	s.creatorLoginBrowser = b
-	s.creatorLoginPage = page
-
 	return &CreatorPhoneLoginResponse{
 		Screenshot: fmt.Sprintf("data:image/png;base64,%s", encodeBase64(otpResult.Screenshot)),
 		Message:    otpResult.Message,
 	}, nil
+}
+
+func (s *XiaohongshuService) retainCreatorLoginSession(b *browser.ProfileBrowser, page *rod.Page, result *xiaohongshu.OTPSendResult, sendErr error) bool {
+	if !shouldRetainCreatorLoginSession(result, sendErr) {
+		return false
+	}
+	// 保存状态，等待 VerifyOTP 调用。confirmed 和 uncertain 都需要保留。
+	s.creatorLoginBrowser = b
+	s.creatorLoginPage = page
+	return true
+}
+
+func shouldRetainCreatorLoginSession(result *xiaohongshu.OTPSendResult, sendErr error) bool {
+	if sendErr != nil || result == nil {
+		return false
+	}
+	return result.Status == xiaohongshu.OTPSendConfirmed || result.Status == xiaohongshu.OTPSendUncertain
 }
 
 // CreatorVerifyOTPResult creator 验证码登录结果
