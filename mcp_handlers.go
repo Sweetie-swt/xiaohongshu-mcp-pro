@@ -904,6 +904,17 @@ func (s *AppServer) handleCreatorPhoneLogin(ctx context.Context, phone string) *
 
 	resp, err := s.xiaohongshuService.CreatorPhoneLogin(phone)
 	if err != nil {
+		if resp != nil {
+			imgData := resp.Screenshot
+			if idx := strings.Index(imgData, ","); idx >= 0 {
+				imgData = imgData[idx+1:]
+			}
+			content := []MCPContent{{Type: "text", Text: resp.Message}}
+			if imgData != "" {
+				content = append(content, MCPContent{Type: "image", Data: imgData, MimeType: "image/png"})
+			}
+			return &MCPToolResult{Content: content, IsError: true}
+		}
 		return &MCPToolResult{
 			Content: []MCPContent{{Type: "text", Text: "发送验证码失败: " + err.Error()}},
 			IsError: true,

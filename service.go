@@ -636,11 +636,17 @@ func (s *XiaohongshuService) CreatorPhoneLogin(phone string) (*CreatorPhoneLogin
 	}
 
 	// 发送验证码
-	shot, err := action.SendOTP(phone)
+	otpResult, err := action.SendOTP(phone)
 	if err != nil {
 		page.Close()
 		b.Close()
-		return nil, err
+		if otpResult == nil {
+			return nil, err
+		}
+		return &CreatorPhoneLoginResponse{
+			Screenshot: fmt.Sprintf("data:image/png;base64,%s", encodeBase64(otpResult.Screenshot)),
+			Message:    otpResult.Message,
+		}, err
 	}
 
 	// 保存状态，等待 VerifyOTP 调用
@@ -648,8 +654,8 @@ func (s *XiaohongshuService) CreatorPhoneLogin(phone string) (*CreatorPhoneLogin
 	s.creatorLoginPage = page
 
 	return &CreatorPhoneLoginResponse{
-		Screenshot: fmt.Sprintf("data:image/png;base64,%s", encodeBase64(shot)),
-		Message:    "验证码已发送，请查看截图后调用 creator_verify_otp 填写验证码",
+		Screenshot: fmt.Sprintf("data:image/png;base64,%s", encodeBase64(otpResult.Screenshot)),
+		Message:    otpResult.Message,
 	}, nil
 }
 

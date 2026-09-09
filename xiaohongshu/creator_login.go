@@ -1,6 +1,7 @@
 package xiaohongshu
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -36,9 +37,41 @@ func (a *CreatorLoginAction) NavigateToLogin() ([]byte, error) {
 	return pp.Screenshot(false, nil)
 }
 
-// SendOTP 填写手机号并点击发送验证码，返回截图供用户确认
-func (a *CreatorLoginAction) SendOTP(phone string) ([]byte, error) {
+// OTPSendResult 是手机号验证码发送阶段的页面结果。
+// 即使返回 error，也尽量保留截图和页面诊断对应的消息供调用方展示。
+type OTPSendResult struct {
+	Screenshot []byte
+	Message    string
+}
+
+type otpPageDiagnostics struct {
+	URL                   string   `json:"url"`
+	Title                 string   `json:"title"`
+	PhoneInputFound       bool     `json:"phone_input_found"`
+	SendButtonFound       bool     `json:"send_button_found"`
+	SendButtonText        string   `json:"send_button_text"`
+	SendButtonDisabled    bool     `json:"send_button_disabled"`
+	SendButtonClass       string   `json:"send_button_class"`
+	VisibleMessages       []string `json:"visible_messages"`
+	VisiblePageText       string   `json:"visible_page_text"`
+	ProtocolCheckboxFound int      `json:"protocol_checkbox_found"`
+	ProtocolCheckboxClick int      `json:"protocol_checkbox_clicked"`
+	ProtocolLabels        []string `json:"protocol_labels"`
+}
+
+type protocolCheckboxDiagnostics struct {
+	Found              int      `json:"found"`
+	Clicked            int      `json:"clicked"`
+	RemainingUnchecked int      `json:"remaining_unchecked"`
+	Labels             []string `json:"labels"`
+}
+
+// SendOTP 填写手机号并点击发送验证码，返回页面确认结果和截图。
+func (a *CreatorLoginAction) SendOTP(phone string) (*OTPSendResult, error) {
 	pp := a.page.Timeout(15 * time.Second)
+
+	beforeInput := a.collectOTPPageDiagnostics()
+	a.logOTPPageDiagnostics("填写手机号前", beforeInput)
 
 	// 用 JS native setter 设置手机号，确保触发 Vue 响应式事件
 	// creator 登录页的 input 没有 type="tel"，且普通 Input() 不触发 Vue 的双向绑定
@@ -55,9 +88,29 @@ func (a *CreatorLoginAction) SendOTP(phone string) ([]byte, error) {
 	if err != nil || !set.Value.Bool() {
 		shot, _ := pp.Screenshot(false, nil)
 		saveDebugShot("creator-login-no-phone-input", shot)
-		return nil, errors.New("未找到手机号输入框")
+		return &OTPSendResult{
+			Screenshot: shot,
+			Message:    "验证码发送失败：未找到手机号输入框",
+		}, errors.New("未找到手机号输入框")
 	}
 	time.Sleep(1 * time.Second) // 等待 Vue 响应式更新按钮状态
+
+	afterInput := a.collectOTPPageDiagnostics()
+	a.logOTPPageDiagnostics("填写手机号后", afterInput)
+
+	// 只在 checkbox 的关联文本明确包含用户协议/隐私协议时勾选，
+	// 不对页面上的无关 checkbox 做猜测性点击。
+	if err := a.ensureCreatorAgreementChecked(); err != nil {
+		shot, _ := pp.Screenshot(false, nil)
+		saveDebugShot("creator-login-agreement-check", shot)
+		return &OTPSendResult{
+			Screenshot: shot,
+			Message:    "验证码发送失败：" + err.Error(),
+		}, err
+	}
+
+	beforeClick := a.collectOTPPageDiagnostics()
+	a.logOTPPageDiagnostics("点击发送验证码前", beforeClick)
 
 	// 用 JS 匹配直接文本节点为"发送验证码"的元素并点击
 	// 避免匹配到包含该文字的父容器
@@ -77,11 +130,289 @@ func (a *CreatorLoginAction) SendOTP(phone string) ([]byte, error) {
 	if err != nil || !clicked.Value.Bool() {
 		shot, _ := pp.Screenshot(false, nil)
 		saveDebugShot("creator-login-no-otp-btn", shot)
-		return nil, errors.New("未找到发送验证码按钮")
+		return &OTPSendResult{
+			Screenshot: shot,
+			Message:    "验证码发送失败：未找到发送验证码按钮",
+		}, errors.New("未找到发送验证码按钮")
 	}
-	time.Sleep(2 * time.Second)
+	afterClick := a.collectOTPPageDiagnostics()
+	logrus.Infof("creator OTP 诊断[发送验证码点击结果]: found=%t clicked=%t button_state_changed=%t",
+		afterClick.SendButtonFound, clicked.Value.Bool(), otpButtonStateChanged(beforeClick, afterClick))
+	a.logOTPPageDiagnostics("点击发送验证码后立即", afterClick)
 
-	return pp.Screenshot(false, nil)
+	// 点击只是触发页面行为；必须等待并读取页面反馈，不能把 click 成功当成短信发送成功。
+	final, message, resultErr := a.waitForOTPSendResult(beforeClick)
+	a.logOTPPageDiagnostics("发送验证码结果", final)
+
+	shot, shotErr := pp.Screenshot(false, nil)
+	if shotErr != nil {
+		logrus.Warnf("creator OTP 结果截图失败: %v", shotErr)
+	}
+	if resultErr != nil {
+		saveDebugShot("creator-login-otp-send-result", shot)
+		return &OTPSendResult{Screenshot: shot, Message: message}, resultErr
+	}
+
+	return &OTPSendResult{Screenshot: shot, Message: message}, nil
+}
+
+func (a *CreatorLoginAction) collectOTPPageDiagnostics() otpPageDiagnostics {
+	d := otpPageDiagnostics{}
+	if info, err := a.page.Info(); err == nil {
+		d.URL = info.URL
+		d.Title = info.Title
+	} else {
+		logrus.Warnf("creator OTP 诊断读取 page URL/title 失败: %v", err)
+	}
+
+	result, err := a.page.Eval(`() => {
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			const rect = el.getBoundingClientRect();
+			return style.display !== 'none' && style.visibility !== 'hidden' &&
+				style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+		};
+		const text = (el) => (el ? (el.innerText || el.textContent || '') : '')
+			.replace(/\s+/g, ' ').trim();
+		const directText = (el) => Array.from(el.childNodes)
+			.filter(n => n.nodeType === 3)
+			.map(n => n.textContent.trim()).join('');
+		const sendDirect = Array.from(document.querySelectorAll('*'))
+			.find(el => directText(el) === '发送验证码');
+		let send = sendDirect;
+		if (sendDirect) {
+			send = sendDirect.closest('button,[role="button"],a') || sendDirect;
+		}
+		if (!send || !visible(send)) {
+			send = Array.from(document.querySelectorAll('button,[role="button"],a,*'))
+				.find(el => visible(el) && /重新发送|重新获取|验证码.*(?:秒|s)/i.test(text(el)));
+		}
+		const disabled = !!(send && (
+			send.disabled || send.hasAttribute('disabled') ||
+			send.getAttribute('aria-disabled') === 'true' ||
+			send.classList.contains('disabled') || send.classList.contains('is-disabled')
+		));
+		const selectors = [
+			'[role="dialog"]', 'dialog', '[role="alert"]', '[aria-live="assertive"]',
+			'[aria-live="polite"]', '[class*="modal"]', '[class*="dialog"]',
+			'[class*="toast"]', '[class*="message"]', '[class*="notice"]',
+			'[class*="warning"]', '[class*="error"]'
+		];
+		const messages = [];
+		const seen = new Set();
+		for (const selector of selectors) {
+			for (const el of document.querySelectorAll(selector)) {
+				if (!visible(el)) continue;
+				const value = text(el);
+				if (!value || value.length > 500 || seen.has(value)) continue;
+				seen.add(value);
+				messages.push(value);
+			}
+		}
+		return JSON.stringify({
+			phone_input_found: !!document.querySelector("input[placeholder*='手机']"),
+			send_button_found: !!sendDirect,
+			send_button_text: text(send),
+			send_button_disabled: disabled,
+			send_button_class: send ? String(send.className || '') : '',
+			visible_messages: messages,
+			visible_page_text: text(document.body).slice(0, 12000)
+		});
+	}`)
+	if err != nil {
+		logrus.Warnf("creator OTP 诊断读取 DOM 失败: %v", err)
+		return d
+	}
+	if err := json.Unmarshal([]byte(result.Value.String()), &d); err != nil {
+		logrus.Warnf("creator OTP 诊断解析 DOM 结果失败: %v", err)
+	}
+	d.URL = firstNonEmpty(d.URL, pageURL(a.page))
+	return d
+}
+
+func (a *CreatorLoginAction) ensureCreatorAgreementChecked() error {
+	result, err := a.page.Eval(`() => {
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			const rect = el.getBoundingClientRect();
+			return style.display !== 'none' && style.visibility !== 'hidden' &&
+				style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+		};
+		const protocolWords = /(用户协议|隐私政策|隐私协议|隐私条款|服务条款)/;
+		const text = (el) => (el ? (el.innerText || el.textContent || '') : '')
+			.replace(/\s+/g, ' ').trim();
+		const labels = [];
+		let found = 0;
+		let clicked = 0;
+		let remainingUnchecked = 0;
+		const boxes = Array.from(document.querySelectorAll('input[type="checkbox"],[role="checkbox"]'));
+		for (const box of boxes) {
+			if (!visible(box)) continue;
+			let associated = '';
+			if (box.id) {
+				const label = Array.from(document.querySelectorAll('label'))
+					.find(item => item.htmlFor === box.id);
+				if (label) associated = text(label);
+			}
+			if (!associated && box.closest('label')) associated = text(box.closest('label'));
+			if (!associated) {
+				let parent = box.parentElement;
+				for (let i = 0; i < 3 && parent; i++, parent = parent.parentElement) {
+					const candidate = text(parent);
+					if (candidate && candidate.length <= 300 && protocolWords.test(candidate)) {
+						associated = candidate;
+						break;
+					}
+				}
+			}
+			if (!associated || !protocolWords.test(associated)) continue;
+			found++;
+			labels.push(associated);
+			const checked = box.type === 'checkbox'
+				? box.checked
+				: box.getAttribute('aria-checked') === 'true';
+			if (!checked) {
+				box.click();
+				clicked++;
+			}
+			const checkedAfter = box.type === 'checkbox'
+				? box.checked
+				: box.getAttribute('aria-checked') === 'true';
+			if (!checkedAfter) remainingUnchecked++;
+		}
+		return JSON.stringify({found, clicked, remaining_unchecked: remainingUnchecked, labels});
+	}`)
+	if err != nil {
+		logrus.Warnf("creator OTP 协议 checkbox 诊断失败: %v", err)
+		return nil
+	}
+
+	var d protocolCheckboxDiagnostics
+	if err := json.Unmarshal([]byte(result.Value.String()), &d); err != nil {
+		logrus.Warnf("creator OTP 协议 checkbox 结果解析失败: %v", err)
+		return nil
+	}
+	logrus.Infof("creator OTP 协议 checkbox: found=%d clicked=%d remaining_unchecked=%d labels=%s",
+		d.Found, d.Clicked, d.RemainingUnchecked, strings.Join(d.Labels, " | "))
+	if d.RemainingUnchecked > 0 {
+		return errors.New("已识别到未勾选的用户协议/隐私协议 checkbox，但勾选后仍未选中")
+	}
+	return nil
+}
+
+func (a *CreatorLoginAction) waitForOTPSendResult(before otpPageDiagnostics) (otpPageDiagnostics, string, error) {
+	deadline := time.Now().Add(6 * time.Second)
+	latest := a.collectOTPPageDiagnostics()
+	for {
+		if signal := otpSuccessSignal(latest); signal != "" {
+			return latest, "验证码发送成功：" + signal, nil
+		}
+		if message := otpErrorSignal(latest); message != "" {
+			return latest, "验证码发送失败：" + message, errors.Errorf("页面提示：%s", message)
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+		latest = a.collectOTPPageDiagnostics()
+	}
+
+	if message := otpErrorSignal(latest); message != "" {
+		return latest, "验证码发送失败：" + message, errors.Errorf("页面提示：%s", message)
+	}
+	logrus.Warnf("creator OTP 发送状态无法确认：按钮点击前 text=%s，点击后 text=%s，disabled=%t，class=%s",
+		before.SendButtonText, latest.SendButtonText, latest.SendButtonDisabled, latest.SendButtonClass)
+	return latest, "验证码发送状态无法确认：未检测到倒计时、成功文案或明确错误提示",
+		errors.New("验证码发送状态无法确认")
+}
+
+func otpSuccessSignal(d otpPageDiagnostics) string {
+	for _, text := range append([]string{d.SendButtonText}, append(d.VisibleMessages, d.VisiblePageText)...) {
+		if strings.Contains(text, "验证码已发送") || strings.Contains(text, "验证码发送成功") ||
+			strings.Contains(text, "短信已发送") || strings.Contains(text, "发送成功") {
+			return truncateDiagnosticText(text, 240)
+		}
+	}
+	if isOTPSendCountdown(d.SendButtonText) {
+		return "发送验证码按钮进入倒计时：" + strings.TrimSpace(d.SendButtonText)
+	}
+	return ""
+}
+
+func otpErrorSignal(d otpPageDiagnostics) string {
+	for _, text := range d.VisibleMessages {
+		clean := strings.TrimSpace(text)
+		if clean == "" || otpSuccessSignal(otpPageDiagnostics{VisiblePageText: clean}) != "" {
+			continue
+		}
+		for _, marker := range []string{"失败", "错误", "无效", "不支持", "暂不", "频繁", "稍后", "重试", "风控", "风险", "限制", "请先", "勾选", "过期", "异常", "禁止", "海外", "升级中", "error", "invalid", "warning"} {
+			if strings.Contains(strings.ToLower(clean), strings.ToLower(marker)) {
+				return clean
+			}
+		}
+	}
+	return ""
+}
+
+func isOTPSendCountdown(text string) bool {
+	text = strings.TrimSpace(strings.ToLower(text))
+	if text == "" {
+		return false
+	}
+	hasCountdownWord := strings.Contains(text, "重新发送") || strings.Contains(text, "重新获取") ||
+		strings.Contains(text, "倒计时") || strings.Contains(text, "秒") || strings.Contains(text, "sec")
+	if !hasCountdownWord {
+		return false
+	}
+	for _, r := range text {
+		if r >= '0' && r <= '9' {
+			return true
+		}
+	}
+	return false
+}
+
+func otpButtonStateChanged(before, after otpPageDiagnostics) bool {
+	return before.SendButtonText != after.SendButtonText ||
+		before.SendButtonDisabled != after.SendButtonDisabled ||
+		before.SendButtonClass != after.SendButtonClass
+}
+
+func truncateDiagnosticText(text string, maxRunes int) string {
+	text = strings.TrimSpace(text)
+	if len([]rune(text)) <= maxRunes {
+		return text
+	}
+	return string([]rune(text)[:maxRunes]) + "…"
+}
+
+func (a *CreatorLoginAction) logOTPPageDiagnostics(stage string, d otpPageDiagnostics) {
+	logrus.Infof("creator OTP 诊断[%s]: URL=%s title=%s phone_input_found=%t send_button_found=%t send_button_text=%s send_button_disabled=%t send_button_class=%s",
+		stage, d.URL, d.Title, d.PhoneInputFound, d.SendButtonFound, d.SendButtonText, d.SendButtonDisabled, d.SendButtonClass)
+	if len(d.VisibleMessages) == 0 {
+		logrus.Infof("creator OTP 诊断[%s]: 可见 dialog/modal/toast/alert 文本=<none>", stage)
+		return
+	}
+	logrus.Infof("creator OTP 诊断[%s]: 可见 dialog/modal/toast/alert 文本=%s", stage, strings.Join(d.VisibleMessages, " | "))
+}
+
+func pageURL(page *rod.Page) string {
+	info, err := page.Info()
+	if err != nil {
+		return ""
+	}
+	return info.URL
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // VerifyOTP 填写验证码并提交登录。
