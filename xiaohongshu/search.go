@@ -3,8 +3,10 @@ package xiaohongshu
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -173,10 +175,14 @@ type SearchAction struct {
 }
 
 func NewSearchAction(page *rod.Page) *SearchAction {
-	pp := page.Timeout(60 * time.Second)
-
-	return &SearchAction{page: pp}
+	return &SearchAction{page: page}
 }
+
+const (
+	searchNavigateTimeout    = 15 * time.Second
+	searchResultReadyTimeout = 40 * time.Second
+	searchTargetURLTimeout   = 800 * time.Millisecond
+)
 
 func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...FilterOption) (feeds []Feed, err error) {
 	if ctx == nil {
@@ -189,9 +195,10 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 		}
 	}()
 
-	// Context() returns a clone; reapply the action timeout after deriving it so
-	// the 60-second page bound is not accidentally discarded.
-	page := s.page.Context(ctx).Timeout(60 * time.Second)
+	// Every search stage derives a fresh page context from this outer request
+	// context. In particular, a timed-out navigation context is never reused by
+	// the ready or extraction stages.
+	page := s.page.Context(ctx)
 	logSearchPageState(page, "before navigate")
 
 	phase = "keyword input"
@@ -202,15 +209,22 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 	phase = "navigate/search page"
 	logrus.Infof("search_feeds: navigate/search page start")
 	logrus.Infof("search_feeds: submit/search trigger start")
-	runSearchNavigation(page, searchURL, diagnoseSearchNavigationFailure)
+	if err := runSearchNavigation(ctx, page, searchURL, diagnoseSearchNavigationFailure); err != nil {
+		return nil, err
+	}
 	logrus.Infof("search_feeds: submit/search trigger end")
 	logSearchPageState(page, "navigate/search page end")
 	logrus.Infof("search_feeds: navigate/search page end")
 
-	phase = "wait result selector"
-	logrus.Infof("search_feeds: wait result selector start")
-	page.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
-	logrus.Infof("search_feeds: wait result selector end")
+	phase = "search result ready"
+	if err := waitForSearchResultReady(ctx, page); err != nil {
+		diagnoseSearchNavigationFailure(page, "search-result-ready", err)
+		return nil, err
+	}
+
+	// The extraction/filter operations use a fresh clone rooted at the original
+	// request context rather than the bounded navigation/ready child contexts.
+	page = s.page.Context(ctx)
 
 	// 先把外部筛选转换为真正的内部选项。一个空 FilterOption 不应仅
 	// 因为 filters slice 非空就触发筛选面板交互。
@@ -243,10 +257,10 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 			option.MustClick()
 		}
 
-		// 等待页面更新
-		page.MustWaitStable()
 		// 重新等待 __INITIAL_STATE__ 更新
-		page.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
+		if err := page.Wait(rod.Eval(`() => window.__INITIAL_STATE__ !== undefined`)); err != nil {
+			return nil, fmt.Errorf("search result ready after filters failed: %w", err)
+		}
 		logrus.Infof("search_feeds: submit/search trigger end")
 	}
 
@@ -278,48 +292,145 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 	return feeds, nil
 }
 
-func runSearchNavigation(page *rod.Page, searchURL string, diagnose func(*rod.Page, string, any)) {
-	runSearchNavigationPhases(
-		func() { page.MustNavigate(searchURL) },
-		func() { page.MustWaitStable() },
+func runSearchNavigation(ctx context.Context, page *rod.Page, searchURL string, diagnose func(*rod.Page, string, any)) error {
+	return runSearchNavigationWithOps(
+		ctx,
+		searchURL,
+		func(stageCtx context.Context, targetURL string) error {
+			return page.Context(stageCtx).Navigate(targetURL)
+		},
+		func(diagnosticCtx context.Context) (string, error) {
+			return readSearchPageURL(page, diagnosticCtx)
+		},
 		func(stage string, original any) {
-			// Diagnostics are best-effort. Swallow a diagnostic panic so the
-			// original staged navigation panic remains the error seen by the service.
+			// Diagnostics are best-effort and must never replace the original
+			// Navigate error returned to the service.
 			if diagnose != nil {
 				func() {
 					defer func() { _ = recover() }()
 					diagnose(page, stage, original)
 				}()
 			}
-			panicSearchNavigationFailure(stage, original)
 		},
 	)
 }
 
-func runSearchNavigationPhases(navigate func(), waitStable func(), onFailure func(string, any)) {
-	runSearchNavigationPhase("MustNavigate", navigate, onFailure)
-	runSearchNavigationPhase("MustWaitStable", waitStable, onFailure)
+func runSearchNavigationWithOps(
+	ctx context.Context,
+	searchURL string,
+	navigate func(context.Context, string) error,
+	readCurrentURL func(context.Context) (string, error),
+	diagnose func(string, any),
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	navigateCtx, cancel := context.WithTimeout(ctx, searchNavigateTimeout)
+	defer cancel()
+	logrus.Infof("search_feeds: Navigate start")
+	err := navigate(navigateCtx, searchURL)
+	if err == nil {
+		logrus.Infof("search_feeds: navigation command completed")
+		return nil
+	}
+
+	if isSearchNavigationTimeout(navigateCtx, ctx, err) {
+		diagnosticCtx, diagnosticCancel := context.WithTimeout(context.Background(), searchTargetURLTimeout)
+		currentURL, urlErr := readCurrentURL(diagnosticCtx)
+		diagnosticCancel()
+		if urlErr == nil && isExpectedSearchURL(currentURL, searchURL) {
+			logrus.Warnf("search_feeds: navigation command timed out after dispatch / target reached url=%s", currentURL)
+			return nil
+		}
+		if urlErr != nil {
+			logrus.Warnf("search_feeds: navigation target URL check unavailable: %v", urlErr)
+		} else {
+			logrus.Warnf("search_feeds: navigation command timed out but target was not reached current_url=%s expected_url=%s", currentURL, searchURL)
+		}
+	}
+
+	if diagnose != nil {
+		diagnose("Navigate", err)
+	}
+	if isSearchNavigationTimeout(navigateCtx, ctx, err) {
+		return fmt.Errorf("navigation command timed out before the search target was reached: %w", err)
+	}
+	return err
 }
 
-func runSearchNavigationPhase(stage string, action func(), onFailure func(string, any)) {
-	logrus.Infof("search_feeds: %s start", stage)
+func isSearchNavigationTimeout(stageCtx, parentCtx context.Context, err error) bool {
+	if err == nil || parentCtx == nil || parentCtx.Err() != nil {
+		return false
+	}
+	if stageCtx != nil && stageCtx.Err() == context.DeadlineExceeded {
+		return true
+	}
+	if stderrors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "timeout")
+}
+
+func readSearchPageURL(page *rod.Page, ctx context.Context) (url string, err error) {
+	if page == nil {
+		return "", fmt.Errorf("page is nil")
+	}
 	defer func() {
 		if original := recover(); original != nil {
-			if onFailure != nil {
-				onFailure(stage, original)
-			}
-			panicSearchNavigationFailure(stage, original)
+			err = fmt.Errorf("read current page URL panic: %v", original)
 		}
 	}()
-	action()
-	logrus.Infof("search_feeds: %s end", stage)
+	diagnosticPage := page.Context(ctx)
+	info, err := diagnosticPage.Info()
+	if err != nil {
+		return "", err
+	}
+	return info.URL, nil
 }
 
-func panicSearchNavigationFailure(stage string, original any) {
-	if err, ok := original.(error); ok {
-		panic(fmt.Errorf("navigation %s failed: %w", stage, err))
+func isExpectedSearchURL(currentURL, expectedURL string) bool {
+	current, err := url.Parse(currentURL)
+	if err != nil {
+		return false
 	}
-	panic(fmt.Errorf("navigation %s failed: %v", stage, original))
+	expected, err := url.Parse(expectedURL)
+	if err != nil {
+		return false
+	}
+	if !strings.EqualFold(current.Hostname(), "www.xiaohongshu.com") || current.Path != "/search_result" {
+		return false
+	}
+	expectedKeyword := expected.Query().Get("keyword")
+	currentKeyword := current.Query().Get("keyword")
+	return expectedKeyword != "" && currentKeyword == expectedKeyword
+}
+
+func waitForSearchResultReady(ctx context.Context, page *rod.Page) error {
+	return waitForSearchResultReadyWith(ctx, func(stageCtx context.Context) error {
+		if page == nil {
+			return fmt.Errorf("page is nil")
+		}
+		return page.Context(stageCtx).Wait(rod.Eval(`() => window.__INITIAL_STATE__ !== undefined`))
+	})
+}
+
+func waitForSearchResultReadyWith(ctx context.Context, wait func(context.Context) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	readyCtx, cancel := context.WithTimeout(ctx, searchResultReadyTimeout)
+	defer cancel()
+	logrus.Infof("search_feeds: search result ready wait start")
+	err := wait(readyCtx)
+	if err != nil {
+		if readyCtx.Err() == context.DeadlineExceeded || stderrors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("search result ready timeout: %w", err)
+		}
+		return fmt.Errorf("search result ready failed: %w", err)
+	}
+	logrus.Infof("search_feeds: search result ready wait end")
+	return nil
 }
 
 func diagnoseSearchNavigationFailure(page *rod.Page, stage string, original any) {

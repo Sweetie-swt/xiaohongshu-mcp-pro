@@ -3,7 +3,6 @@ package xiaohongshu
 import (
 	"context"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -115,46 +114,164 @@ func TestFilterValidation(t *testing.T) {
 	require.Len(t, internalFilters, 5)
 }
 
-func TestSearchNavigationMustNavigateFailureIsStaged(t *testing.T) {
-	var failedStage string
-	waitCalled := false
-	var recovered any
-	func() {
-		defer func() { recovered = recover() }()
-		runSearchNavigationPhases(
-			func() { panic(fmt.Errorf("navigate failed")) },
-			func() { waitCalled = true },
-			func(stage string, _ any) { failedStage = stage },
-		)
-	}()
-	require.Equal(t, "MustNavigate", failedStage)
-	require.False(t, waitCalled, "MustWaitStable must not run after navigation failure")
-	require.Contains(t, fmt.Sprint(recovered), "navigation MustNavigate failed: navigate failed")
-}
-
-func TestSearchNavigationMustWaitStableFailureIsStaged(t *testing.T) {
-	var failedStage string
-	var recovered any
-	func() {
-		defer func() { recovered = recover() }()
-		runSearchNavigationPhases(
-			func() {},
-			func() { panic(fmt.Errorf("stable wait failed")) },
-			func(stage string, _ any) { failedStage = stage },
-		)
-	}()
-	require.Equal(t, "MustWaitStable", failedStage)
-	require.Contains(t, fmt.Sprint(recovered), "navigation MustWaitStable failed: stable wait failed")
-}
-
-func TestSearchNavigationSuccessRunsBothPhases(t *testing.T) {
-	steps := make([]string, 0, 2)
-	runSearchNavigationPhases(
-		func() { steps = append(steps, "navigate") },
-		func() { steps = append(steps, "wait-stable") },
+func TestRunSearchNavigationNavigateSuccess(t *testing.T) {
+	searchURL := makeSearchURL("Kimi")
+	navigateCalls := 0
+	err := runSearchNavigationWithOps(
+		context.Background(),
+		searchURL,
+		func(stageCtx context.Context, targetURL string) error {
+			navigateCalls++
+			_, hasDeadline := stageCtx.Deadline()
+			require.True(t, hasDeadline)
+			require.Equal(t, searchURL, targetURL)
+			return nil
+		},
+		func(context.Context) (string, error) {
+			t.Fatal("target URL check must not run after successful Navigate")
+			return "", nil
+		},
 		func(stage string, original any) { t.Fatalf("unexpected %s failure: %v", stage, original) },
 	)
-	require.Equal(t, []string{"navigate", "wait-stable"}, steps)
+	require.NoError(t, err)
+	require.Equal(t, 1, navigateCalls)
+}
+
+func TestRunSearchNavigationTimeoutTargetReachedEntersReadyStage(t *testing.T) {
+	searchURL := makeSearchURL("老人家一路走好")
+	navigateCalls := 0
+	var navigateCtx context.Context
+	currentURLChecks := 0
+	err := runSearchNavigationWithOps(
+		context.Background(),
+		searchURL,
+		func(stageCtx context.Context, _ string) error {
+			navigateCalls++
+			navigateCtx = stageCtx
+			return context.DeadlineExceeded
+		},
+		func(stageCtx context.Context) (string, error) {
+			currentURLChecks++
+			_, hasDeadline := stageCtx.Deadline()
+			require.True(t, hasDeadline)
+			return searchURL, nil
+		},
+		func(stage string, original any) { t.Fatalf("unexpected %s failure: %v", stage, original) },
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, navigateCalls, "Navigate must not be retried")
+	require.Equal(t, 1, currentURLChecks)
+	require.Error(t, navigateCtx.Err(), "navigation child context should be canceled after the stage")
+
+	readyCtxSeen := context.Context(nil)
+	err = waitForSearchResultReadyWith(context.Background(), func(stageCtx context.Context) error {
+		readyCtxSeen = stageCtx
+		require.Nil(t, stageCtx.Err())
+		return nil
+	})
+	require.NoError(t, err)
+	require.NotEqual(t, navigateCtx, readyCtxSeen, "ready stage must use a new child context")
+}
+
+func TestRunSearchNavigationTimeoutAboutBlankReturnsError(t *testing.T) {
+	var diagnosedStage string
+	err := runSearchNavigationWithOps(
+		context.Background(),
+		makeSearchURL("Kimi"),
+		func(context.Context, string) error { return context.DeadlineExceeded },
+		func(context.Context) (string, error) { return "about:blank", nil },
+		func(stage string, _ any) { diagnosedStage = stage },
+	)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "navigation command timed out before the search target was reached")
+	require.Equal(t, "Navigate", diagnosedStage)
+}
+
+func TestRunSearchNavigationTimeoutWrongTargetReturnsError(t *testing.T) {
+	tests := []struct {
+		name       string
+		currentURL string
+	}{
+		{name: "wrong host", currentURL: "https://xiaohongshu.com/search_result?keyword=Kimi"},
+		{name: "wrong path", currentURL: "https://www.xiaohongshu.com/explore?keyword=Kimi"},
+		{name: "wrong keyword", currentURL: "https://www.xiaohongshu.com/search_result?keyword=Other"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := runSearchNavigationWithOps(
+				context.Background(),
+				makeSearchURL("Kimi"),
+				func(context.Context, string) error { return context.DeadlineExceeded },
+				func(context.Context) (string, error) { return tt.currentURL, nil },
+				func(string, any) {},
+			)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestExpectedSearchURLRequiresExactSearchTargetAndKeyword(t *testing.T) {
+	expected := makeSearchURL("Kimi")
+	tests := []struct {
+		name       string
+		currentURL string
+		want       bool
+	}{
+		{name: "expected target", currentURL: expected, want: true},
+		{name: "source query may differ", currentURL: "https://www.xiaohongshu.com/search_result?keyword=Kimi&source=web_search_result_notes", want: true},
+		{name: "login page", currentURL: "https://www.xiaohongshu.com/login?keyword=Kimi", want: false},
+		{name: "different xiaohongshu path", currentURL: "https://www.xiaohongshu.com/explore?keyword=Kimi", want: false},
+		{name: "different host", currentURL: "https://xiaohongshu.com/search_result?keyword=Kimi", want: false},
+		{name: "different keyword", currentURL: "https://www.xiaohongshu.com/search_result?keyword=Other", want: false},
+		{name: "missing keyword", currentURL: "https://www.xiaohongshu.com/search_result", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, isExpectedSearchURL(tt.currentURL, expected))
+		})
+	}
+}
+
+func TestWaitForSearchResultReadySuccess(t *testing.T) {
+	waitCalled := false
+	err := waitForSearchResultReadyWith(context.Background(), func(stageCtx context.Context) error {
+		waitCalled = true
+		_, hasDeadline := stageCtx.Deadline()
+		require.True(t, hasDeadline)
+		require.Nil(t, stageCtx.Err())
+		return nil
+	})
+	require.NoError(t, err)
+	require.True(t, waitCalled)
+}
+
+func TestWaitForSearchResultReadyTimeoutReturnsExplicitError(t *testing.T) {
+	err := waitForSearchResultReadyWith(context.Background(), func(context.Context) error {
+		return context.DeadlineExceeded
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "search result ready timeout:")
+}
+
+func TestRunSearchNavigationPreservesNonTimeoutError(t *testing.T) {
+	original := fmt.Errorf("connection refused")
+	diagnosed := false
+	err := runSearchNavigationWithOps(
+		context.Background(),
+		makeSearchURL("Kimi"),
+		func(context.Context, string) error { return original },
+		func(context.Context) (string, error) {
+			t.Fatal("target URL check must only run for timeout errors")
+			return "", nil
+		},
+		func(stage string, got any) {
+			diagnosed = true
+			require.Equal(t, "Navigate", stage)
+			require.Equal(t, original, got)
+		},
+	)
+	require.ErrorIs(t, err, original)
+	require.True(t, diagnosed)
 }
 
 func TestSearchNavigationDiagnosticsUseIndependentProjects(t *testing.T) {
@@ -186,28 +303,4 @@ func TestSearchPageDiagnosticDoesNotReuseExpiredContext(t *testing.T) {
 	require.NotNil(t, diagnosticCtx)
 	require.True(t, diagnosticWasActive, "diagnostic context must be active while the diagnostic runs")
 	require.NotEqual(t, expiredCtx, diagnosticCtx, "diagnostics must not reuse the expired action context")
-}
-
-func TestSearchNavigationDiagnosticsPreserveOriginalPanic(t *testing.T) {
-	called := false
-	var recovered any
-	func() {
-		defer func() { recovered = recover() }()
-		runSearchNavigation(nil, "https://example.invalid", func(*rod.Page, string, any) {
-			called = true
-			panic("diagnostic failure")
-		})
-	}()
-	if !called {
-		t.Fatal("navigation diagnostics were not invoked")
-	}
-	if recovered == nil {
-		t.Fatal("expected the original navigation panic")
-	}
-	if !strings.Contains(fmt.Sprint(recovered), "navigation MustNavigate failed") {
-		t.Fatalf("expected staged navigation panic, got %v", recovered)
-	}
-	if strings.Contains(fmt.Sprint(recovered), "diagnostic failure") {
-		t.Fatal("diagnostic panic replaced the original navigation panic")
-	}
 }
