@@ -19,7 +19,8 @@ func NewLogin(page *rod.Page) *LoginAction {
 	return &LoginAction{page: page}
 }
 
-// CheckLoginStatus 检查浏览器是否已有 web_session cookie（无需依赖 DOM 结构）。
+// CheckLoginStatus 检查 www 消费端是否已有可用的 web_session cookie。
+// 仅存在 creator 域 cookie 不代表 www 已登录。
 func (a *LoginAction) CheckLoginStatus(ctx context.Context) (bool, error) {
 	// 先导航一次，让浏览器加载当前 cookies
 	pp := a.page.Context(ctx)
@@ -28,16 +29,25 @@ func (a *LoginAction) CheckLoginStatus(ctx context.Context) (bool, error) {
 	}
 	time.Sleep(1 * time.Second)
 
-	cks, err := a.page.Browser().GetCookies()
+	status, err := ReadConsumerCookieStatus(pp)
 	if err != nil {
-		return false, errors.Wrap(err, "get cookies failed")
+		return false, err
 	}
-	for _, c := range cks {
-		if c.Name == "web_session" && c.Value != "" {
-			return true, nil
-		}
+	if !status.HasValidConsumerSession() {
+		return false, nil
 	}
-	return false, nil
+
+	// www 可能在消费端 session 未被服务端接受时显示认证门槛。此检查
+	// 只读页面 DOM，不执行任何登录或写操作。
+	gate, gateErr := ReadConsumerAuthGate(pp)
+	if gateErr != nil {
+		return false, errors.Wrap(gateErr, "read consumer auth state failed")
+	}
+	if gate.Present {
+		logrus.Warnf("check_login_status: consumer auth gate visible: %s", gate.Description())
+		return false, nil
+	}
+	return true, nil
 }
 
 func (a *LoginAction) Login(ctx context.Context) error {
@@ -124,8 +134,8 @@ func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error
 	return srcVal, false, nil
 }
 
-// WaitForLogin 轮询浏览器 cookies，检测到 web_session 表示登录成功。
-// 直接查 cookies 比检测 DOM 更可靠，不受页面结构变化影响。
+// WaitForLogin 轮询浏览器 cookies，检测到可供 www 使用的 web_session
+// 才表示消费端登录成功。
 func (a *LoginAction) WaitForLogin(ctx context.Context) bool {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -135,14 +145,12 @@ func (a *LoginAction) WaitForLogin(ctx context.Context) bool {
 		case <-ctx.Done():
 			return false
 		case <-ticker.C:
-			cks, err := a.page.Browser().GetCookies()
+			status, err := ReadConsumerCookieStatus(a.page)
 			if err != nil {
 				continue
 			}
-			for _, c := range cks {
-				if c.Name == "web_session" && c.Value != "" {
-					return true
-				}
+			if status.HasValidConsumerSession() {
+				return true
 			}
 		}
 	}

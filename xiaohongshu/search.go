@@ -560,6 +560,12 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 	// the exact decoded keyword rather than a substring match.
 	phase = "search route"
 	if err := waitForSearchRouteReady(ctx, page, keyword); err != nil {
+		if gate, gateErr := ReadConsumerAuthGate(page); gateErr == nil && gate.Present {
+			logrus.Warnf("search_feeds: consumer auth gate detected after search trigger: %s", gate.Description())
+			diagnoseSearchResultState(page, "search-auth-gate", keyword)
+			diagnose(page, "search-auth-gate", err)
+			return nil, fmt.Errorf("search unavailable: consumer authentication gate visible (%s)", gate.Description())
+		}
 		diagnoseSearchResultState(page, "search-route", keyword)
 		diagnose(page, "search-route", err)
 		return nil, err

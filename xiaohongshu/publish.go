@@ -126,25 +126,8 @@ func navigateToPublishPage(pp *rod.Page) error {
 
 // logCookieDiagnostics 记录当前浏览器 cookie 摘要，帮助诊断 session 问题
 func logCookieDiagnostics(pp *rod.Page, label string) {
-	cks, err := pp.Browser().GetCookies()
-	if err != nil {
-		logrus.Warnf("[%s] 获取 cookies 失败: %v", label, err)
-		return
-	}
-	var hasWebSession bool
-	names := make([]string, 0, len(cks))
-	for _, c := range cks {
-		names = append(names, c.Name)
-		if c.Name == "web_session" {
-			hasWebSession = true
-			logrus.Infof("[%s] web_session: domain=%s, httpOnly=%v, secure=%v, value_len=%d, expires=%.0f",
-				label, c.Domain, c.HTTPOnly, c.Secure, len(c.Value), c.Expires)
-		}
-	}
-	if !hasWebSession {
-		logrus.Warnf("[%s] 浏览器中没有 web_session cookie！共 %d 个 cookies: %v", label, len(cks), names)
-	} else {
-		logrus.Infof("[%s] 共 %d 个 cookies，web_session 存在，所有 cookie 名: %v", label, len(cks), names)
+	if err := LogConsumerCookieMetadata(pp, label); err != nil {
+		logrus.Warnf("[%s] cookie 元数据读取失败: %v", label, err)
 	}
 }
 

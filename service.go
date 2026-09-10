@@ -759,27 +759,48 @@ func (s *XiaohongshuService) finalizeCreatorLogin(page *rod.Page) error {
 		return s.creatorFinalizeLoginFunc(page)
 	}
 
-	// 登录成功后跳转到 www.xiaohongshu.com，触发 SSO，让 www session 也写入 profile。
-	// 这样手机号登录一次即可同时建立 creator + www 两个域的 session，无需再扫二维码。
+	// 登录成功后进入 www 的 canonical consumer document，触发 SSO，让
+	// www session 写入 profile。不能只把“导航发出”或“cookie 已保存”当成
+	// SSO 成功：creator 与 www 可能分别处于不同的认证状态。
 	wwwCtx, wwwCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer wwwCancel()
 	wwwPP := page.Context(wwwCtx)
-	if err := wwwPP.Navigate("https://www.xiaohongshu.com"); err != nil {
-		logrus.Warnf("SSO 跳转 www 失败（non-fatal）: %v", err)
-	} else {
-		_ = wwwPP.WaitLoad()
-		time.Sleep(3 * time.Second)
-		if info, err := page.Info(); err == nil {
-			logrus.Infof("SSO 完成，当前 URL: %s", info.URL)
-		}
+	if err := wwwPP.Navigate("https://www.xiaohongshu.com/explore"); err != nil {
+		return fmt.Errorf("www consumer SSO navigation failed: %w", err)
 	}
-	wwwCancel()
+	if err := wwwPP.WaitLoad(); err != nil {
+		// 页面可能已有可用 document，但资源仍未全部结束；后面的
+		// cookie/DOM 验收会决定是否真正成功。
+		logrus.Warnf("www consumer SSO WaitLoad 未完成，继续验收页面状态: %v", err)
+	}
+	time.Sleep(3 * time.Second)
+
+	if info, err := wwwPP.Info(); err == nil {
+		logrus.Infof("www consumer SSO 页面 URL: %s", info.URL)
+	}
+	if err := xiaohongshu.LogConsumerCookieMetadata(page, "creator finalize"); err != nil {
+		return fmt.Errorf("www consumer cookie metadata unavailable: %w", err)
+	}
+	cookieStatus, err := xiaohongshu.ReadConsumerCookieStatus(page)
+	if err != nil {
+		return fmt.Errorf("www consumer cookie status unavailable: %w", err)
+	}
+	gate, err := xiaohongshu.ReadConsumerAuthGate(wwwPP)
+	if err != nil {
+		return fmt.Errorf("www consumer auth state unavailable: %w", err)
+	}
+	if gate.Present {
+		return fmt.Errorf("www consumer session rejected: authentication gate visible (%s)", gate.Description())
+	}
+	if !cookieStatus.HasValidConsumerSession() {
+		return fmt.Errorf("www consumer session not established: %s", cookieStatus.Summary())
+	}
 
 	// 同时保存 cookies 到 JSON（向后兼容 www 操作的 CDP 注入）
 	if err := saveCookies(page); err != nil {
-		logrus.Errorf("creator 登录后保存 cookies 失败: %v", err)
-	} else {
-		logrus.Info("creator + www session 已保存到 profile 及 cookies.json")
+		return fmt.Errorf("creator 登录后保存 cookies 失败: %w", err)
 	}
+	logrus.Info("creator + www session 已通过消费端验收并保存到 profile 及 cookies.json")
 	return nil
 }
 
