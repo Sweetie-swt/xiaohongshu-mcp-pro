@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/go-rod/rod/lib/proto"
 	"github.com/lisiyuan/xiaohongshu-mcp-pro/browser"
 	"github.com/stretchr/testify/require"
 )
@@ -169,4 +170,47 @@ func TestHomepageSearchProbeDoesNotCollectSensitivePageContent(t *testing.T) {
 	require.NotContains(t, homepageSearchProbeScript, "outerHTML")
 	require.NotContains(t, homepageSearchProbeScript, "body.innerText")
 	require.NotContains(t, homepageSearchProbeScript, "body.textContent")
+}
+
+func TestHomepageSearchTriggerListenerSummaryFiltersEventTypes(t *testing.T) {
+	listeners := []*proto.DOMDebuggerEventListener{
+		{Type: "keydown", UseCapture: true, Passive: false, Once: true, ScriptID: "script-1", LineNumber: 10, ColumnNumber: 2},
+		{Type: "click", ScriptID: "script-2", LineNumber: 20, ColumnNumber: 3},
+		{Type: "mouseover", ScriptID: "ignored"},
+	}
+
+	inputSummary := summarizeHomepageSearchTriggerListeners("input", listeners)
+	require.Equal(t, 2, inputSummary.Total)
+	require.Equal(t, map[string]int{"keydown": 1, "click": 1}, inputSummary.Counts)
+	require.Len(t, inputSummary.Details, 2)
+	require.Equal(t, "script-1", inputSummary.Details[0].ScriptID)
+	require.Equal(t, 10, inputSummary.Details[0].LineNumber)
+
+	documentSummary := summarizeHomepageSearchTriggerListeners("document", listeners)
+	require.Equal(t, 2, documentSummary.Total)
+	require.Empty(t, documentSummary.Details, "document listeners should be summarized by counts only")
+	require.Contains(t, formatHomepageSearchTriggerListenerCounts(documentSummary.Counts), "keydown=1")
+}
+
+func TestHomepageSearchTriggerListenerSummaryDoesNotExposeHandlerSource(t *testing.T) {
+	listener := &proto.DOMDebuggerEventListener{
+		Type:    "keydown",
+		Handler: &proto.RuntimeRemoteObject{Description: "function secretHandler() { return 'sensitive'; }"},
+	}
+	summary := summarizeHomepageSearchTriggerListeners("input", []*proto.DOMDebuggerEventListener{listener})
+	formatted := fmt.Sprintf("%+v", summary)
+	require.NotContains(t, formatted, "secretHandler")
+	require.NotContains(t, formatted, "sensitive")
+}
+
+func TestHomepageSearchProbeRecordsInlineHandlerFlagsWithoutReadingHandlers(t *testing.T) {
+	require.Contains(t, homepageSearchProbeScript, "hasAttribute('on' + eventName)")
+	require.NotContains(t, homepageSearchProbeScript, "getAttribute('on")
+	require.NotContains(t, homepageSearchProbeScript, "element.onclick")
+}
+
+func TestHomepageSearchProbeFailureIsBestEffort(t *testing.T) {
+	require.NotPanics(t, func() {
+		probeHomepageSearchControlsBestEffort(nil)
+	})
 }

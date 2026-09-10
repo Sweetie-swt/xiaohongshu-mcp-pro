@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/proto"
 	"github.com/lisiyuan/xiaohongshu-mcp-pro/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -21,9 +22,7 @@ func NewFeedsListAction(page *rod.Page) *FeedsListAction {
 
 	pp.MustNavigate("https://www.xiaohongshu.com")
 	pp.MustWaitDOMStable()
-	if err := probeHomepageSearchControls(pp); err != nil {
-		logrus.Warnf("homepage-search-probe: failed: %v", err)
-	}
+	probeHomepageSearchControlsBestEffort(pp)
 
 	return &FeedsListAction{page: pp}
 }
@@ -76,18 +75,146 @@ type homepageSearchProbeElement struct {
 }
 
 type homepageSearchProbeSnapshot struct {
-	URL                  string                       `json:"url"`
-	Title                string                       `json:"title"`
-	ReadyState           string                       `json:"ready_state"`
-	ViewportWidth        int                          `json:"viewport_width"`
-	ViewportHeight       int                          `json:"viewport_height"`
-	InputCount           int                          `json:"input_count"`
-	TextareaCount        int                          `json:"textarea_count"`
-	ContenteditableCount int                          `json:"contenteditable_count"`
-	ButtonCount          int                          `json:"button_count"`
-	RoleButtonCount      int                          `json:"role_button_count"`
-	InitialStateKeys     []string                     `json:"initial_state_keys"`
-	InputLike            []homepageSearchProbeElement `json:"input_like"`
+	URL                  string                          `json:"url"`
+	Title                string                          `json:"title"`
+	ReadyState           string                          `json:"ready_state"`
+	ViewportWidth        int                             `json:"viewport_width"`
+	ViewportHeight       int                             `json:"viewport_height"`
+	InputCount           int                             `json:"input_count"`
+	TextareaCount        int                             `json:"textarea_count"`
+	ContenteditableCount int                             `json:"contenteditable_count"`
+	ButtonCount          int                             `json:"button_count"`
+	RoleButtonCount      int                             `json:"role_button_count"`
+	InitialStateKeys     []string                        `json:"initial_state_keys"`
+	InputLike            []homepageSearchProbeElement    `json:"input_like"`
+	SearchInput          *homepageSearchProbeInput       `json:"search_input"`
+	InputBoxNodes        []homepageSearchProbeNodeDetail `json:"input_box_nodes"`
+}
+
+type homepageSearchProbeNodeDetail struct {
+	TagName       string                  `json:"tag_name"`
+	ID            string                  `json:"id"`
+	Class         string                  `json:"class"`
+	Role          string                  `json:"role"`
+	AriaLabel     string                  `json:"aria_label"`
+	Title         string                  `json:"title"`
+	DataTestID    string                  `json:"data_testid"`
+	Type          string                  `json:"type"`
+	TabIndex      string                  `json:"tabindex"`
+	Visible       bool                    `json:"visible"`
+	Rect          homepageSearchProbeRect `json:"rect"`
+	Cursor        string                  `json:"cursor"`
+	PointerEvents string                  `json:"pointer_events"`
+	ShortText     string                  `json:"short_text"`
+	Depth         int                     `json:"depth"`
+	ParentIndex   int                     `json:"parent_index"`
+}
+
+type homepageSearchProbeInput struct {
+	homepageSearchProbeNodeDetail
+	Disabled       bool            `json:"disabled"`
+	ReadOnly       bool            `json:"readonly"`
+	Autocomplete   string          `json:"autocomplete"`
+	MaxLength      string          `json:"maxlength"`
+	Spellcheck     bool            `json:"spellcheck"`
+	InputMode      string          `json:"inputmode"`
+	EnterKeyHint   string          `json:"enterkeyhint"`
+	InlineHandlers map[string]bool `json:"inline_handlers"`
+}
+
+type homepageSearchTriggerTarget struct {
+	Name       string
+	Expression string
+}
+
+type homepageSearchTriggerListenerDetail struct {
+	Target       string
+	Type         string
+	UseCapture   bool
+	Passive      bool
+	Once         bool
+	ScriptID     string
+	LineNumber   int
+	ColumnNumber int
+}
+
+type homepageSearchTriggerListenerSummary struct {
+	Target  string
+	Counts  map[string]int
+	Total   int
+	Details []homepageSearchTriggerListenerDetail
+}
+
+var homepageSearchTriggerEventTypes = map[string]struct{}{
+	"keydown":          {},
+	"keyup":            {},
+	"keypress":         {},
+	"input":            {},
+	"change":           {},
+	"compositionstart": {},
+	"compositionend":   {},
+	"click":            {},
+	"submit":           {},
+	"focus":            {},
+	"blur":             {},
+}
+
+var homepageSearchTriggerTargets = []homepageSearchTriggerTarget{
+	{Name: "input", Expression: `document.querySelector('input#search-input')`},
+	{Name: "input-box", Expression: `document.querySelector('div.input-box')`},
+	{Name: "header", Expression: `document.querySelector('header.mask-paper')`},
+	{Name: "app", Expression: `document.querySelector('#app')`},
+	{Name: "document", Expression: `document`},
+	{Name: "window", Expression: `window`},
+}
+
+func summarizeHomepageSearchTriggerListeners(target string, listeners []*proto.DOMDebuggerEventListener) homepageSearchTriggerListenerSummary {
+	summary := homepageSearchTriggerListenerSummary{
+		Target:  target,
+		Counts:  make(map[string]int),
+		Details: make([]homepageSearchTriggerListenerDetail, 0),
+	}
+	detailedTarget := target != "document" && target != "window"
+	for _, listener := range listeners {
+		if listener == nil {
+			continue
+		}
+		if _, ok := homepageSearchTriggerEventTypes[listener.Type]; !ok {
+			continue
+		}
+		summary.Total++
+		summary.Counts[listener.Type]++
+		if detailedTarget {
+			summary.Details = append(summary.Details, homepageSearchTriggerListenerDetail{
+				Target:       target,
+				Type:         listener.Type,
+				UseCapture:   listener.UseCapture,
+				Passive:      listener.Passive,
+				Once:         listener.Once,
+				ScriptID:     string(listener.ScriptID),
+				LineNumber:   listener.LineNumber,
+				ColumnNumber: listener.ColumnNumber,
+			})
+		}
+	}
+	return summary
+}
+
+func formatHomepageSearchTriggerListenerCounts(counts map[string]int) string {
+	if len(counts) == 0 {
+		return "none"
+	}
+	eventTypes := []string{
+		"keydown", "keyup", "keypress", "input", "change", "compositionstart", "compositionend",
+		"click", "submit", "focus", "blur",
+	}
+	parts := make([]string, 0, len(counts))
+	for _, eventType := range eventTypes {
+		if count := counts[eventType]; count > 0 {
+			parts = append(parts, fmt.Sprintf("%s=%d", eventType, count))
+		}
+	}
+	return strings.Join(parts, ",")
 }
 
 type homepageSearchProbeCandidateResult struct {
@@ -177,6 +304,106 @@ func logHomepageSearchProbe(snapshot homepageSearchProbeSnapshot) {
 	logrus.Infof("homepage-search-probe: complete")
 }
 
+func formatHomepageSearchProbeNodeDetail(node homepageSearchProbeNodeDetail) string {
+	return fmt.Sprintf("tag=%s id=%q class=%q role=%q aria_label=%q title=%q data_testid=%q type=%q tabindex=%q visible=%t rect=(%.0f,%.0f %.0fx%.0f) cursor=%q pointer_events=%q short_text=%q",
+		node.TagName, node.ID, node.Class, node.Role, node.AriaLabel, node.Title, node.DataTestID,
+		node.Type, node.TabIndex, node.Visible, node.Rect.X, node.Rect.Y, node.Rect.Width,
+		node.Rect.Height, node.Cursor, node.PointerEvents, node.ShortText)
+}
+
+func formatHomepageSearchProbeInlineHandlers(handlers map[string]bool) string {
+	if len(handlers) == 0 {
+		return "none"
+	}
+	eventTypes := []string{
+		"keydown", "keyup", "keypress", "input", "change", "compositionstart", "compositionend",
+		"click", "submit", "focus", "blur",
+	}
+	parts := make([]string, 0, len(eventTypes))
+	for _, eventType := range eventTypes {
+		if handlers["on"+eventType] {
+			parts = append(parts, "on"+eventType+"=true")
+		}
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, ",")
+}
+
+func logHomepageSearchTriggerStructure(snapshot homepageSearchProbeSnapshot) {
+	if snapshot.SearchInput == nil {
+		logrus.Warn("homepage-search-trigger-probe: input input#search-input not found")
+	} else {
+		input := snapshot.SearchInput
+		logrus.Infof("homepage-search-trigger-probe: input %s disabled=%t readonly=%t autocomplete=%q maxlength=%q spellcheck=%t inputmode=%q enterkeyhint=%q inline_handlers=%s",
+			formatHomepageSearchProbeNodeDetail(input.homepageSearchProbeNodeDetail), input.Disabled, input.ReadOnly,
+			input.Autocomplete, input.MaxLength, input.Spellcheck, input.InputMode, input.EnterKeyHint,
+			formatHomepageSearchProbeInlineHandlers(input.InlineHandlers))
+	}
+
+	for index, node := range snapshot.InputBoxNodes {
+		logrus.Infof("homepage-search-trigger-probe: input_box_child index=%d depth=%d parent_index=%d %s",
+			index, node.Depth, node.ParentIndex, formatHomepageSearchProbeNodeDetail(node))
+	}
+	logrus.Infof("homepage-search-trigger-probe: summary search_input_found=%t input_box_node_count=%d",
+		snapshot.SearchInput != nil, len(snapshot.InputBoxNodes))
+}
+
+func readHomepageSearchTriggerListeners(page *rod.Page, target homepageSearchTriggerTarget) (summary homepageSearchTriggerListenerSummary, found bool, err error) {
+	if page == nil {
+		return summary, false, fmt.Errorf("page is nil")
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("listener probe panic: %v", recovered)
+		}
+	}()
+
+	object, err := page.Evaluate(rod.Eval(target.Expression).ByObject())
+	if err != nil {
+		return summary, false, err
+	}
+	if object == nil || object.ObjectID == "" {
+		return summary, false, nil
+	}
+	found = true
+	defer func() {
+		_ = (proto.RuntimeReleaseObject{ObjectID: object.ObjectID}).Call(page)
+	}()
+
+	result, err := (proto.DOMDebuggerGetEventListeners{ObjectID: object.ObjectID}).Call(page)
+	if err != nil {
+		return summary, true, err
+	}
+	if result == nil {
+		return summary, true, fmt.Errorf("listener result is empty")
+	}
+	return summarizeHomepageSearchTriggerListeners(target.Name, result.Listeners), true, nil
+}
+
+func logHomepageSearchTriggerListeners(page *rod.Page) {
+	for _, target := range homepageSearchTriggerTargets {
+		summary, found, err := readHomepageSearchTriggerListeners(page, target)
+		if err != nil {
+			logrus.Warnf("homepage-search-trigger-probe: listeners target=%s failed: %v", target.Name, err)
+			continue
+		}
+		if !found {
+			logrus.Infof("homepage-search-trigger-probe: listeners target=%s found=false", target.Name)
+			continue
+		}
+		logrus.Infof("homepage-search-trigger-probe: listeners target=%s total=%d counts=%s",
+			target.Name, summary.Total, formatHomepageSearchTriggerListenerCounts(summary.Counts))
+		for _, detail := range summary.Details {
+			logrus.Infof("homepage-search-trigger-probe: listener target=%s type=%s use_capture=%t passive=%t once=%t script_id=%q line=%d column=%d",
+				detail.Target, detail.Type, detail.UseCapture, detail.Passive, detail.Once,
+				detail.ScriptID, detail.LineNumber, detail.ColumnNumber)
+		}
+	}
+	logrus.Infof("homepage-search-trigger-probe: complete")
+}
+
 func probeHomepageSearchControls(page *rod.Page) (err error) {
 	if page == nil {
 		return fmt.Errorf("page is nil")
@@ -202,7 +429,16 @@ func probeHomepageSearchControls(page *rod.Page) (err error) {
 		return fmt.Errorf("parse probe result: %w", err)
 	}
 	logHomepageSearchProbe(snapshot)
+	logHomepageSearchTriggerStructure(snapshot)
+	logHomepageSearchTriggerListeners(page.Context(probeCtx))
 	return nil
+}
+
+func probeHomepageSearchControlsBestEffort(page *rod.Page) {
+	if err := probeHomepageSearchControls(page); err != nil {
+		logrus.Warnf("homepage-search-probe: failed: %v", err)
+		logrus.Warnf("homepage-search-trigger-probe: failed: %v", err)
+	}
 }
 
 const homepageSearchProbeScript = `() => {
@@ -286,6 +522,66 @@ const homepageSearchProbeScript = `() => {
       ancestors: ancestorsOf(element)
     };
   };
+  const nodeDetail = (element, depth, parentIndex) => {
+    const rect = rectOf(element);
+    const style = window.getComputedStyle(element);
+    return {
+      tag_name: element.tagName.toLowerCase(),
+      id: attr(element, 'id'),
+      class: attr(element, 'class'),
+      role: attr(element, 'role'),
+      aria_label: attr(element, 'aria-label'),
+      title: attr(element, 'title'),
+      data_testid: attr(element, 'data-testid'),
+      type: attr(element, 'type'),
+      tabindex: attr(element, 'tabindex'),
+      visible: visible(element, rect),
+      rect,
+      cursor: String(style.cursor || ''),
+      pointer_events: String(style.pointerEvents || ''),
+      short_text: shortSearchText(element),
+      depth,
+      parent_index: parentIndex
+    };
+  };
+  const inlineEventNames = [
+    'keydown', 'keyup', 'keypress', 'input', 'change', 'compositionstart', 'compositionend',
+    'click', 'submit', 'focus', 'blur'
+  ];
+  const inlineHandlerFlags = (element) => {
+    const flags = {};
+    inlineEventNames.forEach((eventName) => {
+      flags['on' + eventName] = element.hasAttribute('on' + eventName);
+    });
+    return flags;
+  };
+  const inputBoxNodes = () => {
+    const box = document.querySelector('div.input-box');
+    if (!box) return [];
+    const result = [];
+    Array.from(box.children).forEach((child, parentIndex) => {
+      result.push(nodeDetail(child, 1, parentIndex));
+      Array.from(child.children).forEach((grandchild) => {
+        result.push(nodeDetail(grandchild, 2, parentIndex));
+      });
+    });
+    return result;
+  };
+  const searchInputInfo = () => {
+    const input = document.querySelector('input#search-input');
+    if (!input) return null;
+    return {
+      ...nodeDetail(input, 0, -1),
+      disabled: !!input.disabled,
+      readonly: !!input.readOnly,
+      autocomplete: attr(input, 'autocomplete'),
+      maxlength: attr(input, 'maxlength'),
+      spellcheck: !!input.spellcheck,
+      inputmode: attr(input, 'inputmode'),
+      enterkeyhint: attr(input, 'enterkeyhint'),
+      inline_handlers: inlineHandlerFlags(input)
+    };
+  };
   const relatedButtons = (element) => {
     const result = [];
     const seen = new Set();
@@ -353,7 +649,9 @@ const homepageSearchProbeScript = `() => {
         form: formInfo(element),
         nearby_buttons: relatedButtons(element)
       };
-    })
+    }),
+    search_input: searchInputInfo(),
+    input_box_nodes: inputBoxNodes()
   });
 }`
 
