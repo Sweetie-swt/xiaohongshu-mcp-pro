@@ -325,6 +325,132 @@ func TestSearchInteractionUsesObservedSelectorsAndNativeRodPath(t *testing.T) {
 	require.NotContains(t, searchHomepageReadyScript, ".value")
 }
 
+func TestSearchTriggerHitTestScriptIsReadOnlyAndSafe(t *testing.T) {
+	require.Contains(t, searchTriggerHitTestScript, "document.elementFromPoint")
+	require.Contains(t, searchTriggerHitTestScript, "getBoundingClientRect")
+	for _, forbidden := range []string{
+		".value",
+		"textContent",
+		"innerHTML",
+		"outerHTML",
+		".click(",
+	} {
+		require.NotContains(t, searchTriggerHitTestScript, forbidden)
+	}
+}
+
+func TestStagedSearchTriggerClickUsesOneMousePair(t *testing.T) {
+	events := make([]string, 0, 6)
+	var downCount, upCount int
+	err := stagedSearchTriggerClickWithOps(searchTriggerClickOps{
+		hitTest: func() error {
+			events = append(events, "hit-test")
+			return nil
+		},
+		waitInteractable: func() (*proto.Point, error) {
+			events = append(events, "interactable")
+			return &proto.Point{X: 10, Y: 20}, nil
+		},
+		moveMouse: func(proto.Point) error {
+			events = append(events, "move")
+			return nil
+		},
+		waitEnabled: func() error {
+			events = append(events, "enabled")
+			return nil
+		},
+		mouseDown: func(proto.InputMouseButton, int) error {
+			events = append(events, "down")
+			downCount++
+			return nil
+		},
+		mouseUp: func(proto.InputMouseButton, int) error {
+			events = append(events, "up")
+			upCount++
+			return nil
+		},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"hit-test", "interactable", "move", "enabled", "down", "up"}, events)
+	require.Equal(t, 1, downCount)
+	require.Equal(t, 1, upCount)
+}
+
+func TestStagedSearchTriggerClickStopsBeforeMouseDownOnStageFailure(t *testing.T) {
+	stageErrors := []struct {
+		name  string
+		stage string
+		want  string
+		err   error
+	}{
+		{name: "hit-test", stage: "hit-test", want: "search trigger hit-test failed", err: fmt.Errorf("covered")},
+		{name: "interactable", stage: "interactable", want: "search trigger interactable wait failed", err: fmt.Errorf("timeout")},
+		{name: "move", stage: "move", want: "search trigger mouse move failed", err: fmt.Errorf("move failed")},
+		{name: "enabled", stage: "enabled", want: "search trigger enabled wait failed", err: fmt.Errorf("disabled")},
+		{name: "mouse down", stage: "down", want: "search trigger mouse down failed", err: fmt.Errorf("down failed")},
+		{name: "mouse up", stage: "up", want: "search trigger mouse up failed", err: fmt.Errorf("up failed")},
+	}
+
+	for _, tt := range stageErrors {
+		t.Run(tt.name, func(t *testing.T) {
+			events := make([]string, 0, 6)
+			downCount, upCount := 0, 0
+			fail := func(stage string) func() error {
+				return func() error {
+					events = append(events, stage)
+					if stage == tt.stage {
+						return tt.err
+					}
+					return nil
+				}
+			}
+			err := stagedSearchTriggerClickWithOps(searchTriggerClickOps{
+				hitTest: fail("hit-test"),
+				waitInteractable: func() (*proto.Point, error) {
+					events = append(events, "interactable")
+					if tt.stage == "interactable" {
+						return nil, tt.err
+					}
+					return &proto.Point{X: 10, Y: 20}, nil
+				},
+				moveMouse: func(proto.Point) error {
+					events = append(events, "move")
+					if tt.stage == "move" {
+						return tt.err
+					}
+					return nil
+				},
+				waitEnabled: fail("enabled"),
+				mouseDown: func(proto.InputMouseButton, int) error {
+					events = append(events, "down")
+					downCount++
+					if tt.stage == "down" {
+						return tt.err
+					}
+					return nil
+				},
+				mouseUp: func(proto.InputMouseButton, int) error {
+					events = append(events, "up")
+					upCount++
+					if tt.stage == "up" {
+						return tt.err
+					}
+					return nil
+				},
+			})
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.want)
+			if tt.stage != "up" {
+				require.Equal(t, 0, upCount, "mouse up must not run before the failing stage completes")
+			}
+			if tt.stage == "hit-test" || tt.stage == "interactable" || tt.stage == "move" || tt.stage == "enabled" {
+				require.Equal(t, 0, downCount, "mouse down must not run before the failing stage completes")
+			}
+		})
+	}
+}
+
 func TestSearchRouteAndDataReadyErrorsAreDistinct(t *testing.T) {
 	routeErr := waitForSearchRouteReadyWith(context.Background(), func(context.Context) error {
 		return context.DeadlineExceeded

@@ -186,7 +186,8 @@ const (
 	searchInputSelector        = "input#search-input"
 	searchIconSelector         = "div.search-icon"
 	searchHomepageTimeout      = 60 * time.Second
-	searchInteractionTimeout   = 20 * time.Second
+	searchInputTimeout         = 20 * time.Second
+	searchTriggerClickTimeout  = 20 * time.Second
 	searchRouteReadyTimeout    = 15 * time.Second
 	searchDataReadyTimeout     = 40 * time.Second
 	searchTraceSnapshotTimeout = 500 * time.Millisecond
@@ -482,19 +483,28 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 		defer navigationTrace.Stop()
 	}
 
-	phase = "homepage search interaction"
-	interactionCtx, interactionCancel := context.WithTimeout(ctx, searchInteractionTimeout)
-	defer interactionCancel()
-	interactionPage := s.page.Context(interactionCtx)
+	phase = "homepage search input"
+	inputCtx, inputCancel := context.WithTimeout(ctx, searchInputTimeout)
+	defer inputCancel()
+	inputPage := s.page.Context(inputCtx)
 
 	logrus.Infof("search_feeds: search input lookup start")
-	searchInput, err := interactionPage.Element(searchInputSelector)
+	searchInput, err := inputPage.Element(searchInputSelector)
 	if err != nil {
 		return nil, fmt.Errorf("search input lookup failed: %w", err)
 	}
 	if searchInput == nil {
 		return nil, fmt.Errorf("search input lookup failed: input#search-input is nil")
 	}
+	inputReleased := false
+	defer func() {
+		if inputReleased {
+			return
+		}
+		if err := searchInput.Release(); err != nil {
+			logrus.Warnf("search_feeds: search input remote object release failed: %v", err)
+		}
+	}()
 	logrus.Infof("search_feeds: search input found")
 
 	logrus.Infof("search_feeds: keyword input start")
@@ -508,31 +518,35 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 	if err := searchInput.Release(); err != nil {
 		logrus.Warnf("search_feeds: search input remote object release failed: %v", err)
 	}
+	inputReleased = true
+	inputCancel()
 
+	phase = "search trigger click"
+	clickCtx, clickCancel := context.WithTimeout(ctx, searchTriggerClickTimeout)
+	defer clickCancel()
+	clickPage := s.page.Context(clickCtx)
 	logrus.Infof("search_feeds: search trigger lookup start")
-	searchIcon, err := interactionPage.Element(searchIconSelector)
+	searchIcon, err := clickPage.Element(searchIconSelector)
 	if err != nil {
 		return nil, fmt.Errorf("search trigger lookup failed: %w", err)
 	}
 	if searchIcon == nil {
 		return nil, fmt.Errorf("search trigger lookup failed: div.search-icon is nil")
 	}
+	defer func() {
+		if err := searchIcon.Release(); err != nil {
+			logrus.Warnf("search_feeds: search trigger remote object release failed: %v", err)
+		}
+	}()
 	logrus.Infof("search_feeds: search trigger found")
 
-	phase = "search trigger click"
-	logrus.Infof("search_feeds: search trigger click start")
-	if err := searchIcon.Click(proto.InputMouseButtonLeft, 1); err != nil {
+	if err := stagedSearchTriggerClick(clickPage, searchIcon); err != nil {
 		diagnoseSearchResultState(page, "search-trigger-click", keyword)
 		if navigationTrace != nil {
 			diagnoseSearchNavigationFailureWithTrace(page, "search-trigger-click", err, navigationTrace)
 		}
-		return nil, fmt.Errorf("search trigger click failed: %w", err)
+		return nil, err
 	}
-	logrus.Infof("search_feeds: search trigger click end")
-	if err := searchIcon.Release(); err != nil {
-		logrus.Warnf("search_feeds: search trigger remote object release failed: %v", err)
-	}
-	interactionCancel()
 
 	diagnose := func(diagnosticPage *rod.Page, stage string, original any) {
 		diagnoseSearchNavigationFailureWithTrace(diagnosticPage, stage, original, navigationTrace)
@@ -705,6 +719,225 @@ const searchResultStateDiagnosticScript = `(keyword) => {
     feeds_count: feedsCount
   });
 }`
+
+const searchTriggerHitTestScript = `() => {
+  const target = this;
+  const targetRect = target.getBoundingClientRect();
+  const centerX = targetRect.left + targetRect.width / 2;
+  const centerY = targetRect.top + targetRect.height / 2;
+
+  const describe = (node) => {
+    if (!node || node.nodeType !== 1) return null;
+    const style = window.getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    return {
+      tag: String(node.tagName || '').toLowerCase(),
+      id: String(node.id || ''),
+      class: String(node.getAttribute('class') || '').slice(0, 160),
+      pointer_events: String(style.pointerEvents || ''),
+      cursor: String(style.cursor || ''),
+      visible: style.display !== 'none' && style.visibility !== 'hidden' &&
+        Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0
+    };
+  };
+
+  const hit = document.elementFromPoint(centerX, centerY);
+  const ancestors = [];
+  let ancestor = hit ? hit.parentElement : null;
+  while (ancestor && ancestors.length < 3) {
+    ancestors.push(describe(ancestor));
+    ancestor = ancestor.parentElement;
+  }
+
+  return JSON.stringify({
+    rect: {
+      x: targetRect.x,
+      y: targetRect.y,
+      width: targetRect.width,
+      height: targetRect.height
+    },
+    center_x: centerX,
+    center_y: centerY,
+    hit: describe(hit),
+    hit_is_target: hit === target,
+    hit_is_descendant: !!hit && target.contains(hit),
+    hit_is_ancestor: !!hit && hit !== target && hit.contains(target),
+    ancestors: ancestors
+  });
+}`
+
+type searchTriggerHitNode struct {
+	Tag           string `json:"tag"`
+	ID            string `json:"id"`
+	Class         string `json:"class"`
+	PointerEvents string `json:"pointer_events"`
+	Cursor        string `json:"cursor"`
+	Visible       bool   `json:"visible"`
+}
+
+type searchTriggerHitTest struct {
+	Rect struct {
+		X      float64 `json:"x"`
+		Y      float64 `json:"y"`
+		Width  float64 `json:"width"`
+		Height float64 `json:"height"`
+	} `json:"rect"`
+	CenterX         float64                `json:"center_x"`
+	CenterY         float64                `json:"center_y"`
+	Hit             *searchTriggerHitNode  `json:"hit"`
+	HitIsTarget     bool                   `json:"hit_is_target"`
+	HitIsDescendant bool                   `json:"hit_is_descendant"`
+	HitIsAncestor   bool                   `json:"hit_is_ancestor"`
+	Ancestors       []searchTriggerHitNode `json:"ancestors"`
+}
+
+type searchTriggerClickOps struct {
+	hitTest          func() error
+	waitInteractable func() (*proto.Point, error)
+	moveMouse        func(proto.Point) error
+	waitEnabled      func() error
+	mouseDown        func(proto.InputMouseButton, int) error
+	mouseUp          func(proto.InputMouseButton, int) error
+}
+
+func stagedSearchTriggerClick(page *rod.Page, searchIcon *rod.Element) error {
+	if page == nil {
+		return fmt.Errorf("search trigger click failed: page is nil")
+	}
+	if searchIcon == nil {
+		return fmt.Errorf("search trigger click failed: element is nil")
+	}
+
+	clickPage := page.Context(searchIcon.GetContext())
+	mouse := clickPage.Mouse
+	return stagedSearchTriggerClickWithOps(searchTriggerClickOps{
+		hitTest: func() error {
+			return diagnoseSearchTriggerHitTest(searchIcon)
+		},
+		waitInteractable: searchIcon.WaitInteractable,
+		moveMouse:        mouse.MoveTo,
+		waitEnabled:      searchIcon.WaitEnabled,
+		mouseDown:        mouse.Down,
+		mouseUp:          mouse.Up,
+	})
+}
+
+func stagedSearchTriggerClickWithOps(ops searchTriggerClickOps) error {
+	if ops.hitTest == nil || ops.waitInteractable == nil || ops.moveMouse == nil ||
+		ops.waitEnabled == nil || ops.mouseDown == nil || ops.mouseUp == nil {
+		return fmt.Errorf("search trigger click failed: incomplete staged click operations")
+	}
+
+	logrus.Infof("search_feeds: search trigger hit-test start")
+	if err := ops.hitTest(); err != nil {
+		return fmt.Errorf("search trigger hit-test failed: %w", err)
+	}
+	logrus.Infof("search_feeds: search trigger hit-test end")
+
+	logrus.Infof("search_feeds: search trigger interactable wait start")
+	point, err := ops.waitInteractable()
+	if err != nil {
+		return fmt.Errorf("search trigger interactable wait failed: %w", err)
+	}
+	if point == nil {
+		return fmt.Errorf("search trigger interactable wait failed: no interactable point")
+	}
+	logrus.Infof("search_feeds: search trigger interactable wait end")
+
+	logrus.Infof("search_feeds: search trigger mouse move start")
+	if err := ops.moveMouse(*point); err != nil {
+		return fmt.Errorf("search trigger mouse move failed: %w", err)
+	}
+	logrus.Infof("search_feeds: search trigger mouse move end")
+
+	logrus.Infof("search_feeds: search trigger enabled wait start")
+	if err := ops.waitEnabled(); err != nil {
+		return fmt.Errorf("search trigger enabled wait failed: %w", err)
+	}
+	logrus.Infof("search_feeds: search trigger enabled wait end")
+
+	const (
+		button    = proto.InputMouseButtonLeft
+		clickOnce = 1
+	)
+	logrus.Infof("search_feeds: search trigger mouse down start")
+	if err := ops.mouseDown(button, clickOnce); err != nil {
+		return fmt.Errorf("search trigger mouse down failed: %w", err)
+	}
+	logrus.Infof("search_feeds: search trigger mouse down end")
+
+	logrus.Infof("search_feeds: search trigger mouse up start")
+	if err := ops.mouseUp(button, clickOnce); err != nil {
+		return fmt.Errorf("search trigger mouse up failed: %w", err)
+	}
+	logrus.Infof("search_feeds: search trigger mouse up end")
+	logrus.Infof("search_feeds: search trigger click dispatched")
+	return nil
+}
+
+func diagnoseSearchTriggerHitTest(element *rod.Element) error {
+	if element == nil {
+		return fmt.Errorf("element is nil")
+	}
+	result, err := element.Eval(searchTriggerHitTestScript)
+	if err != nil {
+		return err
+	}
+	if result == nil {
+		return fmt.Errorf("empty hit-test result")
+	}
+	var hitTest searchTriggerHitTest
+	if err := json.Unmarshal([]byte(result.Value.String()), &hitTest); err != nil {
+		return fmt.Errorf("parse hit-test result: %w", err)
+	}
+
+	logrus.Infof("search_feeds: search trigger hit-test rect=(%.1f,%.1f %.1fx%.1f) center=(%.1f,%.1f) hit=%s hit_is_target=%t hit_is_descendant=%t hit_is_ancestor=%t hit_pointer_events=%s hit_cursor=%s hit_visible=%t ancestors=%v",
+		hitTest.Rect.X, hitTest.Rect.Y, hitTest.Rect.Width, hitTest.Rect.Height,
+		hitTest.CenterX, hitTest.CenterY, formatSearchTriggerHitNode(hitTest.Hit),
+		hitTest.HitIsTarget, hitTest.HitIsDescendant, hitTest.HitIsAncestor,
+		searchTriggerHitNodePointerEvents(hitTest.Hit), searchTriggerHitNodeCursor(hitTest.Hit),
+		searchTriggerHitNodeVisible(hitTest.Hit), formatSearchTriggerHitNodes(hitTest.Ancestors))
+	if hitTest.Hit != nil && !hitTest.HitIsTarget && !hitTest.HitIsDescendant {
+		logrus.Warnf("search_feeds: search trigger hit-test target is not the hit element; interactable wait will decide whether it is covered")
+	}
+	return nil
+}
+
+func formatSearchTriggerHitNode(node *searchTriggerHitNode) string {
+	if node == nil {
+		return "none"
+	}
+	return fmt.Sprintf("tag=%s id=%s class=%s", node.Tag, node.ID, node.Class)
+}
+
+func formatSearchTriggerHitNodes(nodes []searchTriggerHitNode) string {
+	if len(nodes) == 0 {
+		return "[]"
+	}
+	parts := make([]string, 0, len(nodes))
+	for i := range nodes {
+		parts = append(parts, formatSearchTriggerHitNode(&nodes[i]))
+	}
+	return "[" + strings.Join(parts, "; ") + "]"
+}
+
+func searchTriggerHitNodePointerEvents(node *searchTriggerHitNode) string {
+	if node == nil {
+		return ""
+	}
+	return node.PointerEvents
+}
+
+func searchTriggerHitNodeCursor(node *searchTriggerHitNode) string {
+	if node == nil {
+		return ""
+	}
+	return node.Cursor
+}
+
+func searchTriggerHitNodeVisible(node *searchTriggerHitNode) bool {
+	return node != nil && node.Visible
+}
 
 func bootstrapSearchHomepage(ctx context.Context, page *rod.Page) error {
 	if page == nil {
