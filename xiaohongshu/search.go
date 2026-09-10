@@ -182,9 +182,13 @@ func NewSearchAction(page *rod.Page) *SearchAction {
 }
 
 const (
-	searchNavigateTimeout      = 15 * time.Second
-	searchResultReadyTimeout   = 40 * time.Second
-	searchTargetURLTimeout     = 800 * time.Millisecond
+	searchHomepageURL          = "https://www.xiaohongshu.com"
+	searchInputSelector        = "input#search-input"
+	searchIconSelector         = "div.search-icon"
+	searchHomepageTimeout      = 60 * time.Second
+	searchInteractionTimeout   = 20 * time.Second
+	searchRouteReadyTimeout    = 15 * time.Second
+	searchDataReadyTimeout     = 40 * time.Second
 	searchTraceSnapshotTimeout = 500 * time.Millisecond
 )
 
@@ -460,16 +464,16 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 		}
 	}()
 
-	// Every search stage derives a fresh page context from this outer request
-	// context. In particular, a timed-out navigation context is never reused by
-	// the ready or extraction stages.
-	page := s.page.Context(ctx)
-	logSearchPageState(page, "before navigate")
+	// Build a normal consumer homepage first. Every later stage derives a fresh
+	// page context from the outer request context; no expired stage context is
+	// reused for route, data, or extraction work.
+	phase = "homepage bootstrap"
+	if err := bootstrapSearchHomepage(ctx, s.page); err != nil {
+		return nil, err
+	}
 
-	phase = "keyword input"
-	logrus.Infof("search_feeds: keyword input start")
-	searchURL := makeSearchURL(keyword)
-	logrus.Infof("search_feeds: keyword input end")
+	page := s.page.Context(ctx)
+	logrus.Infof("search_feeds: homepage ready")
 
 	navigationTrace, traceErr := startSearchNavigationTrace(ctx, page)
 	if traceErr != nil {
@@ -478,27 +482,83 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 		defer navigationTrace.Stop()
 	}
 
-	phase = "navigate/search page"
-	logrus.Infof("search_feeds: navigate/search page start")
-	logrus.Infof("search_feeds: submit/search trigger start")
+	phase = "homepage search interaction"
+	interactionCtx, interactionCancel := context.WithTimeout(ctx, searchInteractionTimeout)
+	defer interactionCancel()
+	interactionPage := s.page.Context(interactionCtx)
+
+	logrus.Infof("search_feeds: search input lookup start")
+	searchInput, err := interactionPage.Element(searchInputSelector)
+	if err != nil {
+		return nil, fmt.Errorf("search input lookup failed: %w", err)
+	}
+	if searchInput == nil {
+		return nil, fmt.Errorf("search input lookup failed: input#search-input is nil")
+	}
+	logrus.Infof("search_feeds: search input found")
+
+	logrus.Infof("search_feeds: keyword input start")
+	if err := searchInput.SelectAllText(); err != nil {
+		return nil, fmt.Errorf("search input select all failed: %w", err)
+	}
+	if err := searchInput.Input(keyword); err != nil {
+		return nil, fmt.Errorf("search keyword input failed: %w", err)
+	}
+	logrus.Infof("search_feeds: keyword input end")
+	if err := searchInput.Release(); err != nil {
+		logrus.Warnf("search_feeds: search input remote object release failed: %v", err)
+	}
+
+	logrus.Infof("search_feeds: search trigger lookup start")
+	searchIcon, err := interactionPage.Element(searchIconSelector)
+	if err != nil {
+		return nil, fmt.Errorf("search trigger lookup failed: %w", err)
+	}
+	if searchIcon == nil {
+		return nil, fmt.Errorf("search trigger lookup failed: div.search-icon is nil")
+	}
+	logrus.Infof("search_feeds: search trigger found")
+
+	phase = "search trigger click"
+	logrus.Infof("search_feeds: search trigger click start")
+	if err := searchIcon.Click(proto.InputMouseButtonLeft, 1); err != nil {
+		diagnoseSearchResultState(page, "search-trigger-click", keyword)
+		if navigationTrace != nil {
+			diagnoseSearchNavigationFailureWithTrace(page, "search-trigger-click", err, navigationTrace)
+		}
+		return nil, fmt.Errorf("search trigger click failed: %w", err)
+	}
+	logrus.Infof("search_feeds: search trigger click end")
+	if err := searchIcon.Release(); err != nil {
+		logrus.Warnf("search_feeds: search trigger remote object release failed: %v", err)
+	}
+	interactionCancel()
+
 	diagnose := func(diagnosticPage *rod.Page, stage string, original any) {
 		diagnoseSearchNavigationFailureWithTrace(diagnosticPage, stage, original, navigationTrace)
 	}
-	if err := runSearchNavigation(ctx, page, searchURL, diagnose); err != nil {
-		return nil, err
-	}
-	logrus.Infof("search_feeds: submit/search trigger end")
-	logSearchPageState(page, "navigate/search page end")
-	logrus.Infof("search_feeds: navigate/search page end")
 
-	phase = "search result ready"
-	if err := waitForSearchResultReady(ctx, page); err != nil {
-		diagnoseSearchNavigationFailureWithTrace(page, "search-result-ready", err, navigationTrace)
+	// The click may use either a document navigation or SPA routing. The route
+	// check is therefore independent from the navigation trace and validates
+	// the exact decoded keyword rather than a substring match.
+	phase = "search route"
+	if err := waitForSearchRouteReady(ctx, page, keyword); err != nil {
+		diagnoseSearchResultState(page, "search-route", keyword)
+		diagnose(page, "search-route", err)
 		return nil, err
 	}
+	logSearchRouteReady(page, keyword)
+
+	phase = "search data"
+	if err := waitForSearchDataReady(ctx, page, keyword); err != nil {
+		diagnoseSearchResultState(page, "search-data", keyword)
+		diagnose(page, "search-data", err)
+		return nil, err
+	}
+	logrus.Infof("search_feeds: search data ready")
 
 	// The extraction/filter operations use a fresh clone rooted at the original
-	// request context rather than the bounded navigation/ready child contexts.
+	// request context rather than the bounded route/data child contexts.
 	page = s.page.Context(ctx)
 
 	// 先把外部筛选转换为真正的内部选项。一个空 FilterOption 不应仅
@@ -532,16 +592,13 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 			option.MustClick()
 		}
 
-		// 重新等待 __INITIAL_STATE__ 更新
-		if err := page.Wait(rod.Eval(`() => window.__INITIAL_STATE__ !== undefined`)); err != nil {
-			return nil, fmt.Errorf("search result ready after filters failed: %w", err)
-		}
+		// 保持现有筛选交互；筛选后仍使用当前页面上的 search.feeds 提取。
 		logrus.Infof("search_feeds: submit/search trigger end")
 	}
 
 	phase = "extract results"
 	logrus.Infof("search_feeds: extract results start")
-	result := page.MustEval(`() => {
+	resultObject, err := page.Eval(`() => {
 		if (window.__INITIAL_STATE__ &&
 		    window.__INITIAL_STATE__.search &&
 		    window.__INITIAL_STATE__.search.feeds) {
@@ -552,7 +609,14 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 			}
 		}
 		return "";
-	}`).String()
+	}`)
+	if err != nil {
+		return nil, fmt.Errorf("search results extraction failed: %w", err)
+	}
+	if resultObject == nil {
+		return nil, fmt.Errorf("search results extraction returned an empty evaluation result")
+	}
+	result := resultObject.Value.String()
 
 	if result == "" {
 		logrus.Infof("search_feeds: extract results end count=0")
@@ -567,145 +631,279 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 	return feeds, nil
 }
 
-func runSearchNavigation(ctx context.Context, page *rod.Page, searchURL string, diagnose func(*rod.Page, string, any)) error {
-	return runSearchNavigationWithOps(
+const searchHomepageReadyScript = `() => {
+  if (window.location.hostname !== 'www.xiaohongshu.com') return false;
+  if (document.readyState === 'loading') return false;
+
+  const input = document.querySelector('input#search-input');
+  const icon = document.querySelector('div.search-icon');
+  if (!input || !icon || input.tagName !== 'INPUT') return false;
+
+  const inputRect = input.getBoundingClientRect();
+  const iconRect = icon.getBoundingClientRect();
+  const inputStyle = window.getComputedStyle(input);
+  const iconStyle = window.getComputedStyle(icon);
+  const visible = (rect, style) => style.display !== 'none' &&
+    style.visibility !== 'hidden' && Number(style.opacity || 1) > 0 &&
+    rect.width > 0 && rect.height > 0;
+
+  return input.type === 'text' && !input.disabled && !input.readOnly &&
+    visible(inputRect, inputStyle) && visible(iconRect, iconStyle) &&
+    iconStyle.pointerEvents !== 'none';
+}`
+
+const searchRouteReadyScript = `(keyword) => {
+  if (window.location.hostname !== 'www.xiaohongshu.com') return false;
+  if (window.location.pathname !== '/search_result') return false;
+  return new URLSearchParams(window.location.search).get('keyword') === keyword;
+}`
+
+const searchDataReadyScript = `(keyword) => {
+  if (window.location.hostname !== 'www.xiaohongshu.com') return false;
+  if (window.location.pathname !== '/search_result') return false;
+  if (new URLSearchParams(window.location.search).get('keyword') !== keyword) return false;
+
+  const state = window.__INITIAL_STATE__;
+  const search = state && state.search;
+  if (!search || !search.feeds) return false;
+
+  const feeds = search.feeds;
+  const feedsData = feeds.value !== undefined ? feeds.value : feeds._value;
+  return Array.isArray(feedsData);
+}`
+
+const searchResultStateDiagnosticScript = `(keyword) => {
+  const params = new URLSearchParams(window.location.search);
+  const state = window.__INITIAL_STATE__;
+  const search = state && state.search;
+  const feeds = search && search.feeds;
+  const feedsData = feeds && (feeds.value !== undefined ? feeds.value : feeds._value);
+
+  let feedsType = 'missing';
+  let feedsCount = -1;
+  if (feeds) {
+    if (Array.isArray(feedsData)) {
+      feedsType = 'array';
+      feedsCount = feedsData.length;
+    } else if (feedsData === null) {
+      feedsType = 'null';
+    } else if (feedsData !== undefined) {
+      feedsType = typeof feedsData;
+    }
+  }
+
+  return JSON.stringify({
+    url_path: window.location.origin + window.location.pathname,
+    title: String(document.title || '').slice(0, 200),
+    ready_state: String(document.readyState || ''),
+    route_matches: window.location.hostname === 'www.xiaohongshu.com' &&
+      window.location.pathname === '/search_result' && params.get('keyword') === keyword,
+    keyword_matches: params.get('keyword') === keyword,
+    source_present: params.has('source'),
+    search_state_exists: !!search,
+    feeds_type: feedsType,
+    feeds_count: feedsCount
+  });
+}`
+
+func bootstrapSearchHomepage(ctx context.Context, page *rod.Page) error {
+	if page == nil {
+		return fmt.Errorf("homepage bootstrap failed: page is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	return bootstrapSearchHomepageWith(
 		ctx,
-		searchURL,
 		func(stageCtx context.Context, targetURL string) error {
 			return page.Context(stageCtx).Navigate(targetURL)
 		},
-		func(diagnosticCtx context.Context) (string, error) {
-			return readSearchPageURL(page, diagnosticCtx)
+		func(stageCtx context.Context) error {
+			return page.Context(stageCtx).WaitDOMStable(time.Second, 0)
 		},
-		func(stage string, original any) {
-			// Diagnostics are best-effort and must never replace the original
-			// Navigate error returned to the service.
-			if diagnose != nil {
-				func() {
-					defer func() { _ = recover() }()
-					diagnose(page, stage, original)
-				}()
-			}
+		func(stageCtx context.Context) error {
+			return page.Context(stageCtx).Wait(rod.Eval(searchHomepageReadyScript))
 		},
 	)
 }
 
-func runSearchNavigationWithOps(
+func bootstrapSearchHomepageWith(
 	ctx context.Context,
-	searchURL string,
 	navigate func(context.Context, string) error,
-	readCurrentURL func(context.Context) (string, error),
-	diagnose func(string, any),
+	waitDOMStable func(context.Context) error,
+	waitReady func(context.Context) error,
 ) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-
-	navigateCtx, cancel := context.WithTimeout(ctx, searchNavigateTimeout)
+	if navigate == nil || waitDOMStable == nil || waitReady == nil {
+		return fmt.Errorf("homepage bootstrap failed: incomplete stage operation")
+	}
+	homepageCtx, cancel := context.WithTimeout(ctx, searchHomepageTimeout)
 	defer cancel()
-	logrus.Infof("search_feeds: Navigate start")
-	err := navigate(navigateCtx, searchURL)
-	if err == nil {
-		logrus.Infof("search_feeds: navigation command completed")
-		return nil
-	}
 
-	if isSearchNavigationTimeout(navigateCtx, ctx, err) {
-		diagnosticCtx, diagnosticCancel := context.WithTimeout(context.Background(), searchTargetURLTimeout)
-		currentURL, urlErr := readCurrentURL(diagnosticCtx)
-		diagnosticCancel()
-		if urlErr == nil && isExpectedSearchURL(currentURL, searchURL) {
-			logrus.Warnf("search_feeds: navigation command timed out after dispatch / target reached url=%s", currentURL)
-			return nil
+	logrus.Infof("search_feeds: homepage bootstrap start")
+	if err := navigate(homepageCtx, searchHomepageURL); err != nil {
+		if homepageCtx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("homepage bootstrap timeout: %w", homepageCtx.Err())
 		}
-		if urlErr != nil {
-			logrus.Warnf("search_feeds: navigation target URL check unavailable: %v", urlErr)
-		} else {
-			logrus.Warnf("search_feeds: navigation command timed out but target was not reached current_url=%s expected_url=%s", currentURL, searchURL)
+		return fmt.Errorf("homepage navigation failed: %w", err)
+	}
+	if err := waitDOMStable(homepageCtx); err != nil {
+		if homepageCtx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("homepage bootstrap timeout: %w", homepageCtx.Err())
 		}
+		return fmt.Errorf("homepage DOM ready failed: %w", err)
 	}
-
-	if diagnose != nil {
-		diagnose("Navigate", err)
+	if err := waitReady(homepageCtx); err != nil {
+		if homepageCtx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("homepage ready timeout: %w", err)
+		}
+		return fmt.Errorf("homepage ready failed: %w", err)
 	}
-	if isSearchNavigationTimeout(navigateCtx, ctx, err) {
-		return fmt.Errorf("navigation command timed out before the search target was reached: %w", err)
-	}
-	return err
+	logrus.Infof("search_feeds: homepage bootstrap end")
+	return nil
 }
 
-func isSearchNavigationTimeout(stageCtx, parentCtx context.Context, err error) bool {
-	if err == nil || parentCtx == nil || parentCtx.Err() != nil {
-		return false
-	}
-	if stageCtx != nil && stageCtx.Err() == context.DeadlineExceeded {
-		return true
-	}
-	if stderrors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	return strings.Contains(strings.ToLower(err.Error()), "timeout")
-}
-
-func readSearchPageURL(page *rod.Page, ctx context.Context) (url string, err error) {
+func waitForSearchRouteReady(ctx context.Context, page *rod.Page, keyword string) error {
 	if page == nil {
-		return "", fmt.Errorf("page is nil")
+		return fmt.Errorf("search route failed: page is nil")
 	}
-	defer func() {
-		if original := recover(); original != nil {
-			err = fmt.Errorf("read current page URL panic: %v", original)
-		}
-	}()
-	diagnosticPage := page.Context(ctx)
-	info, err := diagnosticPage.Info()
-	if err != nil {
-		return "", err
-	}
-	return info.URL, nil
-}
-
-func isExpectedSearchURL(currentURL, expectedURL string) bool {
-	current, err := url.Parse(currentURL)
-	if err != nil {
-		return false
-	}
-	expected, err := url.Parse(expectedURL)
-	if err != nil {
-		return false
-	}
-	if !strings.EqualFold(current.Hostname(), "www.xiaohongshu.com") || current.Path != "/search_result" {
-		return false
-	}
-	expectedKeyword := expected.Query().Get("keyword")
-	currentKeyword := current.Query().Get("keyword")
-	return expectedKeyword != "" && currentKeyword == expectedKeyword
-}
-
-func waitForSearchResultReady(ctx context.Context, page *rod.Page) error {
-	return waitForSearchResultReadyWith(ctx, func(stageCtx context.Context) error {
-		if page == nil {
-			return fmt.Errorf("page is nil")
-		}
-		return page.Context(stageCtx).Wait(rod.Eval(`() => window.__INITIAL_STATE__ !== undefined`))
+	return waitForSearchRouteReadyWith(ctx, func(stageCtx context.Context) error {
+		return page.Context(stageCtx).Wait(rod.Eval(searchRouteReadyScript, keyword))
 	})
 }
 
-func waitForSearchResultReadyWith(ctx context.Context, wait func(context.Context) error) error {
+func waitForSearchRouteReadyWith(ctx context.Context, wait func(context.Context) error) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	readyCtx, cancel := context.WithTimeout(ctx, searchResultReadyTimeout)
+	routeCtx, cancel := context.WithTimeout(ctx, searchRouteReadyTimeout)
 	defer cancel()
-	logrus.Infof("search_feeds: search result ready wait start")
-	err := wait(readyCtx)
+	logrus.Infof("search_feeds: search route wait start")
+	err := wait(routeCtx)
 	if err != nil {
-		if readyCtx.Err() == context.DeadlineExceeded || stderrors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("search result ready timeout: %w", err)
+		if routeCtx.Err() == context.DeadlineExceeded || stderrors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("search route timeout: %w", err)
 		}
-		return fmt.Errorf("search result ready failed: %w", err)
+		return fmt.Errorf("search route failed: %w", err)
 	}
-	logrus.Infof("search_feeds: search result ready wait end")
+	logrus.Infof("search_feeds: search route wait end")
 	return nil
+}
+
+func waitForSearchDataReady(ctx context.Context, page *rod.Page, keyword string) error {
+	if page == nil {
+		return fmt.Errorf("search data ready failed: page is nil")
+	}
+	return waitForSearchDataReadyWith(ctx, func(stageCtx context.Context) error {
+		return page.Context(stageCtx).Wait(rod.Eval(searchDataReadyScript, keyword))
+	})
+}
+
+func waitForSearchDataReadyWith(ctx context.Context, wait func(context.Context) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	dataCtx, cancel := context.WithTimeout(ctx, searchDataReadyTimeout)
+	defer cancel()
+	logrus.Infof("search_feeds: search data wait start")
+	err := wait(dataCtx)
+	if err != nil {
+		if dataCtx.Err() == context.DeadlineExceeded || stderrors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("search data ready timeout: %w", err)
+		}
+		return fmt.Errorf("search data ready failed: %w", err)
+	}
+	logrus.Infof("search_feeds: search data wait end")
+	return nil
+}
+
+func searchRouteURLMatches(rawURL, keyword string) bool {
+	if keyword == "" {
+		return false
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(parsed.Hostname(), "www.xiaohongshu.com") &&
+		parsed.Path == "/search_result" && parsed.Query().Get("keyword") == keyword
+}
+
+func safeSearchURLForLog(rawURL string) string {
+	if rawURL == "about:blank" {
+		return rawURL
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "<unavailable>"
+	}
+
+	path := parsed.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+	result := parsed.Scheme + "://" + parsed.Host + path
+	safeQuery := url.Values{}
+	for _, key := range []string{"keyword", "source"} {
+		for _, value := range parsed.Query()[key] {
+			safeQuery.Add(key, value)
+		}
+	}
+	if encoded := safeQuery.Encode(); encoded != "" {
+		result += "?" + encoded
+	}
+	return result
+}
+
+func logSearchRouteReady(page *rod.Page, keyword string) {
+	if page == nil {
+		logrus.Warn("search_feeds: search route ready page is nil")
+		return
+	}
+	info, err := page.Info()
+	if err != nil {
+		logrus.Warnf("search_feeds: search route ready URL unavailable: %v", err)
+		return
+	}
+	if !searchRouteURLMatches(info.URL, keyword) {
+		logrus.Warnf("search_feeds: search route ready URL validation mismatch url=%s", safeSearchURLForLog(info.URL))
+	}
+	logrus.Infof("search_feeds: search route ready url=%s title=%q", safeSearchURLForLog(info.URL), info.Title)
+}
+
+type searchResultStateDiagnostic struct {
+	URLPath          string `json:"url_path"`
+	Title            string `json:"title"`
+	ReadyState       string `json:"ready_state"`
+	RouteMatches     bool   `json:"route_matches"`
+	KeywordMatches   bool   `json:"keyword_matches"`
+	SourcePresent    bool   `json:"source_present"`
+	SearchStateExist bool   `json:"search_state_exists"`
+	FeedsType        string `json:"feeds_type"`
+	FeedsCount       int    `json:"feeds_count"`
+}
+
+func diagnoseSearchResultState(page *rod.Page, stage, keyword string) {
+	err := runSearchPageDiagnostic(page, 1500*time.Millisecond, func(diagnosticPage *rod.Page) error {
+		result, err := diagnosticPage.Eval(searchResultStateDiagnosticScript, keyword)
+		if err != nil {
+			return err
+		}
+		var state searchResultStateDiagnostic
+		if err := json.Unmarshal([]byte(result.Value.String()), &state); err != nil {
+			return fmt.Errorf("parse search result state diagnostics: %w", err)
+		}
+		logrus.Warnf("search_feeds: search state diagnostic stage=%s url_path=%s title=%q ready_state=%s route_matches=%t keyword_matches=%t source_present=%t search_state_exists=%t feeds_type=%s feeds_count=%d",
+			stage, state.URLPath, state.Title, state.ReadyState, state.RouteMatches, state.KeywordMatches,
+			state.SourcePresent, state.SearchStateExist, state.FeedsType, state.FeedsCount)
+		return nil
+	})
+	if err != nil {
+		logrus.Warnf("search_feeds: search state diagnostic stage=%s unavailable: %v", stage, err)
+	}
 }
 
 func diagnoseSearchNavigationFailure(page *rod.Page, stage string, original any) {
@@ -919,7 +1117,7 @@ func logSearchPageState(page *rod.Page, stage string) {
 		logrus.Warnf("search_feeds: page state unavailable at %s: %v", stage, err)
 		return
 	}
-	logrus.Infof("search_feeds: %s url=%s title=%s", stage, info.URL, info.Title)
+	logrus.Infof("search_feeds: %s url=%s title=%s", stage, safeSearchURLForLog(info.URL), info.Title)
 }
 
 func makeSearchURL(keyword string) string {

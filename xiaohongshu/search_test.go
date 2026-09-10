@@ -258,164 +258,108 @@ func TestSearchBrowserDiagnosticsContinueAfterIndependentFailure(t *testing.T) {
 	require.Equal(t, 2, calls, "Target and frame-tree diagnostics must be independent")
 }
 
-func TestRunSearchNavigationNavigateSuccess(t *testing.T) {
-	searchURL := makeSearchURL("Kimi")
-	navigateCalls := 0
-	err := runSearchNavigationWithOps(
+func TestBootstrapSearchHomepageUsesHomepageBeforeControls(t *testing.T) {
+	steps := make([]string, 0, 3)
+	err := bootstrapSearchHomepageWith(
 		context.Background(),
-		searchURL,
 		func(stageCtx context.Context, targetURL string) error {
-			navigateCalls++
+			steps = append(steps, "navigate:"+targetURL)
 			_, hasDeadline := stageCtx.Deadline()
-			require.True(t, hasDeadline)
-			require.Equal(t, searchURL, targetURL)
+			require.True(t, hasDeadline, "homepage bootstrap must derive a bounded stage context")
 			return nil
 		},
-		func(context.Context) (string, error) {
-			t.Fatal("target URL check must not run after successful Navigate")
-			return "", nil
+		func(context.Context) error {
+			steps = append(steps, "dom-stable")
+			return nil
 		},
-		func(stage string, original any) { t.Fatalf("unexpected %s failure: %v", stage, original) },
+		func(context.Context) error {
+			steps = append(steps, "homepage-ready")
+			return nil
+		},
 	)
 	require.NoError(t, err)
-	require.Equal(t, 1, navigateCalls)
+	require.Equal(t, []string{
+		"navigate:https://www.xiaohongshu.com",
+		"dom-stable",
+		"homepage-ready",
+	}, steps)
 }
 
-func TestRunSearchNavigationTimeoutTargetReachedEntersReadyStage(t *testing.T) {
-	searchURL := makeSearchURL("老人家一路走好")
-	navigateCalls := 0
-	var navigateCtx context.Context
-	currentURLChecks := 0
-	err := runSearchNavigationWithOps(
-		context.Background(),
-		searchURL,
-		func(stageCtx context.Context, _ string) error {
-			navigateCalls++
-			navigateCtx = stageCtx
-			return context.DeadlineExceeded
-		},
-		func(stageCtx context.Context) (string, error) {
-			currentURLChecks++
-			_, hasDeadline := stageCtx.Deadline()
-			require.True(t, hasDeadline)
-			return searchURL, nil
-		},
-		func(stage string, original any) { t.Fatalf("unexpected %s failure: %v", stage, original) },
-	)
-	require.NoError(t, err)
-	require.Equal(t, 1, navigateCalls, "Navigate must not be retried")
-	require.Equal(t, 1, currentURLChecks)
-	require.Error(t, navigateCtx.Err(), "navigation child context should be canceled after the stage")
-
-	readyCtxSeen := context.Context(nil)
-	err = waitForSearchResultReadyWith(context.Background(), func(stageCtx context.Context) error {
-		readyCtxSeen = stageCtx
-		require.Nil(t, stageCtx.Err())
-		return nil
-	})
-	require.NoError(t, err)
-	require.NotEqual(t, navigateCtx, readyCtxSeen, "ready stage must use a new child context")
-}
-
-func TestRunSearchNavigationTimeoutAboutBlankReturnsError(t *testing.T) {
-	var diagnosedStage string
-	err := runSearchNavigationWithOps(
-		context.Background(),
-		makeSearchURL("Kimi"),
-		func(context.Context, string) error { return context.DeadlineExceeded },
-		func(context.Context) (string, error) { return "about:blank", nil },
-		func(stage string, _ any) { diagnosedStage = stage },
-	)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "navigation command timed out before the search target was reached")
-	require.Equal(t, "Navigate", diagnosedStage)
-}
-
-func TestRunSearchNavigationTimeoutWrongTargetReturnsError(t *testing.T) {
+func TestSearchRouteURLMatchesExactDecodedKeyword(t *testing.T) {
 	tests := []struct {
-		name       string
-		currentURL string
+		name string
+		url  string
+		want bool
 	}{
-		{name: "wrong host", currentURL: "https://xiaohongshu.com/search_result?keyword=Kimi"},
-		{name: "wrong path", currentURL: "https://www.xiaohongshu.com/explore?keyword=Kimi"},
-		{name: "wrong keyword", currentURL: "https://www.xiaohongshu.com/search_result?keyword=Other"},
+		{name: "exact keyword", url: "https://www.xiaohongshu.com/search_result?keyword=老人家&source=web_search", want: true},
+		{name: "substring is not enough", url: "https://www.xiaohongshu.com/search_result?keyword=老人家一路走好", want: false},
+		{name: "wrong host", url: "https://xiaohongshu.com/search_result?keyword=老人家", want: false},
+		{name: "wrong path", url: "https://www.xiaohongshu.com/explore?keyword=老人家", want: false},
+		{name: "missing keyword", url: "https://www.xiaohongshu.com/search_result", want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := runSearchNavigationWithOps(
-				context.Background(),
-				makeSearchURL("Kimi"),
-				func(context.Context, string) error { return context.DeadlineExceeded },
-				func(context.Context) (string, error) { return tt.currentURL, nil },
-				func(string, any) {},
-			)
-			require.Error(t, err)
+			require.Equal(t, tt.want, searchRouteURLMatches(tt.url, "老人家"))
 		})
 	}
 }
 
-func TestExpectedSearchURLRequiresExactSearchTargetAndKeyword(t *testing.T) {
-	expected := makeSearchURL("Kimi")
-	tests := []struct {
-		name       string
-		currentURL string
-		want       bool
-	}{
-		{name: "expected target", currentURL: expected, want: true},
-		{name: "source query may differ", currentURL: "https://www.xiaohongshu.com/search_result?keyword=Kimi&source=web_search_result_notes", want: true},
-		{name: "login page", currentURL: "https://www.xiaohongshu.com/login?keyword=Kimi", want: false},
-		{name: "different xiaohongshu path", currentURL: "https://www.xiaohongshu.com/explore?keyword=Kimi", want: false},
-		{name: "different host", currentURL: "https://xiaohongshu.com/search_result?keyword=Kimi", want: false},
-		{name: "different keyword", currentURL: "https://www.xiaohongshu.com/search_result?keyword=Other", want: false},
-		{name: "missing keyword", currentURL: "https://www.xiaohongshu.com/search_result", want: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.want, isExpectedSearchURL(tt.currentURL, expected))
-		})
-	}
+func TestSearchReadyScriptsRequireRouteAndSearchData(t *testing.T) {
+	require.Contains(t, searchRouteReadyScript, "window.location.pathname !== '/search_result'")
+	require.Contains(t, searchRouteReadyScript, "URLSearchParams")
+	require.NotContains(t, searchRouteReadyScript, "source")
+
+	require.Contains(t, searchDataReadyScript, "window.__INITIAL_STATE__")
+	require.Contains(t, searchDataReadyScript, "Array.isArray(feedsData)")
+	require.Contains(t, searchDataReadyScript, "window.location.pathname !== '/search_result'")
+	require.Contains(t, searchDataReadyScript, "URLSearchParams")
+	require.NotContains(t, searchDataReadyScript, "feedsData.length > 0")
+	require.NotContains(t, searchHomepageReadyScript, "__INITIAL_STATE__")
 }
 
-func TestWaitForSearchResultReadySuccess(t *testing.T) {
-	waitCalled := false
-	err := waitForSearchResultReadyWith(context.Background(), func(stageCtx context.Context) error {
-		waitCalled = true
-		_, hasDeadline := stageCtx.Deadline()
-		require.True(t, hasDeadline)
-		require.Nil(t, stageCtx.Err())
-		return nil
-	})
-	require.NoError(t, err)
-	require.True(t, waitCalled)
+func TestSearchInteractionUsesObservedSelectorsAndNativeRodPath(t *testing.T) {
+	require.Equal(t, "input#search-input", searchInputSelector)
+	require.Equal(t, "div.search-icon", searchIconSelector)
+	require.Contains(t, searchHomepageReadyScript, "input#search-input")
+	require.Contains(t, searchHomepageReadyScript, "div.search-icon")
+	require.NotContains(t, searchHomepageReadyScript, ".value")
 }
 
-func TestWaitForSearchResultReadyTimeoutReturnsExplicitError(t *testing.T) {
-	err := waitForSearchResultReadyWith(context.Background(), func(context.Context) error {
+func TestSearchRouteAndDataReadyErrorsAreDistinct(t *testing.T) {
+	routeErr := waitForSearchRouteReadyWith(context.Background(), func(context.Context) error {
 		return context.DeadlineExceeded
 	})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "search result ready timeout:")
+	require.Error(t, routeErr)
+	require.Contains(t, routeErr.Error(), "search route timeout:")
+
+	dataErr := waitForSearchDataReadyWith(context.Background(), func(context.Context) error {
+		return context.DeadlineExceeded
+	})
+	require.Error(t, dataErr)
+	require.Contains(t, dataErr.Error(), "search data ready timeout:")
 }
 
-func TestRunSearchNavigationPreservesNonTimeoutError(t *testing.T) {
-	original := fmt.Errorf("connection refused")
-	diagnosed := false
-	err := runSearchNavigationWithOps(
-		context.Background(),
-		makeSearchURL("Kimi"),
-		func(context.Context, string) error { return original },
-		func(context.Context) (string, error) {
-			t.Fatal("target URL check must only run for timeout errors")
-			return "", nil
-		},
-		func(stage string, got any) {
-			diagnosed = true
-			require.Equal(t, "Navigate", stage)
-			require.Equal(t, original, got)
-		},
-	)
-	require.ErrorIs(t, err, original)
-	require.True(t, diagnosed)
+func TestSearchReadyStagesUseFreshContexts(t *testing.T) {
+	parentCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var routeCtx context.Context
+	var dataCtx context.Context
+
+	err := waitForSearchRouteReadyWith(parentCtx, func(ctx context.Context) error {
+		routeCtx = ctx
+		require.Nil(t, ctx.Err())
+		return nil
+	})
+	require.NoError(t, err)
+
+	err = waitForSearchDataReadyWith(parentCtx, func(ctx context.Context) error {
+		dataCtx = ctx
+		require.Nil(t, ctx.Err())
+		return nil
+	})
+	require.NoError(t, err)
+	require.NotSame(t, routeCtx, dataCtx)
+	require.Nil(t, parentCtx.Err())
 }
 
 func TestSearchNavigationDiagnosticsUseIndependentProjects(t *testing.T) {
