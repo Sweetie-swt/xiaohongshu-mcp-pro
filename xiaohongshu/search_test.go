@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/go-rod/rod"
 	"github.com/lisiyuan/xiaohongshu-mcp-pro/browser"
 	"github.com/stretchr/testify/require"
 )
@@ -68,6 +69,14 @@ func TestSearchWithFilters(t *testing.T) {
 }
 
 func TestFilterValidation(t *testing.T) {
+	emptyInternalFilters, err := collectInternalFilters(FilterOption{})
+	require.NoError(t, err)
+	require.Empty(t, emptyInternalFilters, "an empty FilterOption must skip the filter UI path")
+
+	validInternalFilters, err := collectInternalFilters(FilterOption{NoteType: "图文"})
+	require.NoError(t, err)
+	require.Len(t, validInternalFilters, 1, "a real filter must keep the filter UI path enabled")
+
 	// 测试有效的筛选选项转换
 	validFilter := FilterOption{
 		NoteType:    "图文",
@@ -102,4 +111,25 @@ func TestFilterValidation(t *testing.T) {
 	internalFilters, err = convertToInternalFilters(allFilters)
 	require.NoError(t, err)
 	require.Len(t, internalFilters, 5)
+}
+
+func TestSearchNavigationDiagnosticsPreserveOriginalPanic(t *testing.T) {
+	called := false
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		runSearchNavigation(nil, "https://example.invalid", func(*rod.Page, any) {
+			called = true
+			panic("diagnostic failure")
+		})
+	}()
+	if !called {
+		t.Fatal("navigation diagnostics were not invoked")
+	}
+	if recovered == nil {
+		t.Fatal("expected the original navigation panic")
+	}
+	if recovered == "diagnostic failure" {
+		t.Fatal("diagnostic panic replaced the original navigation panic")
+	}
 }

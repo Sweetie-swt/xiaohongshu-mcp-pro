@@ -400,3 +400,35 @@ func TestMCPToolRegistrationCount(t *testing.T) {
 		t.Fatalf("registered MCP tools=%d, want 21", got)
 	}
 }
+
+func TestSearchFilterOptionsOnlyPassesRealFilters(t *testing.T) {
+	if got := searchFilterOptions(FilterOption{}); len(got) != 0 {
+		t.Fatalf("empty search filter produced %d filter arguments, want 0", len(got))
+	}
+
+	cases := []struct {
+		name  string
+		input FilterOption
+	}{
+		{name: "sort", input: FilterOption{SortBy: "最新"}},
+		{name: "note type", input: FilterOption{NoteType: "图文"}},
+		{name: "publish time", input: FilterOption{PublishTime: "一天内"}},
+		{name: "scope", input: FilterOption{SearchScope: "未看过"}},
+		{name: "location", input: FilterOption{Location: "同城"}},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got := searchFilterOptions(tt.input)
+			if len(got) != 1 {
+				t.Fatalf("real filter produced %d filter arguments, want 1", len(got))
+			}
+			if got[0].SortBy != tt.input.SortBy ||
+				got[0].NoteType != tt.input.NoteType ||
+				got[0].PublishTime != tt.input.PublishTime ||
+				got[0].SearchScope != tt.input.SearchScope ||
+				got[0].Location != tt.input.Location {
+				t.Fatalf("filter was not passed through unchanged: got=%#v want=%#v", got[0], tt.input)
+			}
+		})
+	}
+}

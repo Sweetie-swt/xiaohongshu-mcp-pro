@@ -135,6 +135,18 @@ func findInternalOption(filtersIndex int, text string) (internalFilterOption, er
 	return internalFilterOption{}, fmt.Errorf("在筛选组 %d 中未找到文本 '%s'", filtersIndex, text)
 }
 
+func collectInternalFilters(filters ...FilterOption) ([]internalFilterOption, error) {
+	var allInternalFilters []internalFilterOption
+	for _, filter := range filters {
+		internalFilters, err := convertToInternalFilters(filter)
+		if err != nil {
+			return nil, fmt.Errorf("筛选选项转换失败: %w", err)
+		}
+		allInternalFilters = append(allInternalFilters, internalFilters...)
+	}
+	return allInternalFilters, nil
+}
+
 // validateInternalFilterOption 验证内部筛选选项是否在有效范围内
 func validateInternalFilterOption(filter internalFilterOption) error {
 	// 检查筛选组索引是否有效
@@ -190,9 +202,8 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 	phase = "navigate/search page"
 	logrus.Infof("search_feeds: navigate/search page start")
 	logrus.Infof("search_feeds: submit/search trigger start")
-	page.MustNavigate(searchURL)
+	runSearchNavigation(page, searchURL, diagnoseSearchNavigationFailure)
 	logrus.Infof("search_feeds: submit/search trigger end")
-	page.MustWaitStable()
 	logSearchPageState(page, "navigate/search page end")
 	logrus.Infof("search_feeds: navigate/search page end")
 
@@ -201,20 +212,15 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 	page.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
 	logrus.Infof("search_feeds: wait result selector end")
 
-	// 如果有筛选条件，则应用筛选
-	if len(filters) > 0 {
+	// 先把外部筛选转换为真正的内部选项。一个空 FilterOption 不应仅
+	// 因为 filters slice 非空就触发筛选面板交互。
+	allInternalFilters, err := collectInternalFilters(filters...)
+	if err != nil {
+		return nil, err
+	}
+	if len(allInternalFilters) > 0 {
 		phase = "submit/search trigger"
 		logrus.Infof("search_feeds: submit/search trigger start")
-		// 将所有 FilterOption 转换为内部筛选选项
-		var allInternalFilters []internalFilterOption
-		for _, filter := range filters {
-			internalFilters, err := convertToInternalFilters(filter)
-			if err != nil {
-				return nil, fmt.Errorf("筛选选项转换失败: %w", err)
-			}
-			allInternalFilters = append(allInternalFilters, internalFilters...)
-		}
-
 		// 验证所有内部筛选选项
 		for _, filter := range allInternalFilters {
 			if err := validateInternalFilterOption(filter); err != nil {
@@ -270,6 +276,79 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 
 	logrus.Infof("search_feeds: extract results end count=%d", len(feeds))
 	return feeds, nil
+}
+
+func runSearchNavigation(page *rod.Page, searchURL string, diagnose func(*rod.Page, any)) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			// Diagnostics are best-effort. Swallow a diagnostic panic so the
+			// original navigation panic remains the error seen by the service.
+			if diagnose != nil {
+				func() {
+					defer func() { _ = recover() }()
+					diagnose(page, recovered)
+				}()
+			}
+			panic(recovered)
+		}
+	}()
+	page.MustNavigate(searchURL)
+	page.MustWaitStable()
+}
+
+func diagnoseSearchNavigationFailure(page *rod.Page, original any) {
+	logrus.Warnf("search_feeds: navigation failed, original=%v", original)
+	if page == nil {
+		logrus.Warn("search_feeds: navigation diagnostics skipped because page is nil")
+		return
+	}
+
+	const diagnosticTimeout = 800 * time.Millisecond
+	diagnosticCtx, cancel := context.WithTimeout(context.Background(), diagnosticTimeout)
+	defer cancel()
+	diagnosticPage := page.Context(diagnosticCtx).Timeout(diagnosticTimeout)
+
+	if info, err := diagnosticPage.Info(); err != nil {
+		logrus.Warnf("search_feeds: navigation diagnostics URL/title unavailable: %v", err)
+	} else {
+		logrus.Warnf("search_feeds: navigation diagnostics url=%s title=%s", info.URL, info.Title)
+	}
+
+	result, err := diagnosticPage.Eval(`() => {
+		const body = (document.body && (document.body.innerText || document.body.textContent) || '').slice(0, 4000);
+		return JSON.stringify({
+			url: String(window.location.href || ''),
+			title: String(document.title || ''),
+			ready_state: String(document.readyState || ''),
+			is_about_blank: window.location.href === 'about:blank',
+			is_xiaohongshu: /xiaohongshu\.com$/.test(window.location.hostname || ''),
+			has_login_text: /登录|验证码|手机号/.test(body),
+			has_verification_text: /安全验证|扫码|验证/.test(body),
+			body_text_length: body.length
+		});
+	}`)
+	if err != nil {
+		logrus.Warnf("search_feeds: navigation diagnostics document state unavailable: %v", err)
+		return
+	}
+
+	var state struct {
+		URL                 string `json:"url"`
+		Title               string `json:"title"`
+		ReadyState          string `json:"ready_state"`
+		IsAboutBlank        bool   `json:"is_about_blank"`
+		IsXiaohongshu       bool   `json:"is_xiaohongshu"`
+		HasLoginText        bool   `json:"has_login_text"`
+		HasVerificationText bool   `json:"has_verification_text"`
+		BodyTextLength      int    `json:"body_text_length"`
+	}
+	if err := json.Unmarshal([]byte(result.Value.Str()), &state); err != nil {
+		logrus.Warnf("search_feeds: navigation diagnostics parse failed: %v", err)
+		return
+	}
+	logrus.Warnf("search_feeds: navigation diagnostics ready_state=%s url=%s title=%s about_blank=%t xiaohongshu=%t login_text=%t verification_text=%t body_text_length=%d",
+		state.ReadyState, state.URL, state.Title, state.IsAboutBlank, state.IsXiaohongshu,
+		state.HasLoginText, state.HasVerificationText, state.BodyTextLength)
 }
 
 func logSearchPageState(page *rod.Page, stage string) {

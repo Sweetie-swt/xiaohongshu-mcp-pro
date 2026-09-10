@@ -317,16 +317,8 @@ func (s *AppServer) handleSearchFeeds(ctx context.Context, args SearchFeedsArgs)
 
 	logrus.Infof("MCP: 搜索Feeds - 关键词: %s", args.Keyword)
 
-	// 将 MCP 的 FilterOption 转换为 xiaohongshu.FilterOption
-	filter := xiaohongshu.FilterOption{
-		SortBy:      args.Filters.SortBy,
-		NoteType:    args.Filters.NoteType,
-		PublishTime: args.Filters.PublishTime,
-		SearchScope: args.Filters.SearchScope,
-		Location:    args.Filters.Location,
-	}
-
-	result, err := s.xiaohongshuService.SearchFeeds(ctx, args.Keyword, filter)
+	filters := searchFilterOptions(args.Filters)
+	result, err := s.xiaohongshuService.SearchFeeds(ctx, args.Keyword, filters...)
 	if err != nil {
 		return &MCPToolResult{
 			Content: []MCPContent{{
@@ -355,6 +347,26 @@ func (s *AppServer) handleSearchFeeds(ctx context.Context, args SearchFeedsArgs)
 			Text: string(jsonData),
 		}},
 	}
+}
+
+// searchFilterOptions 只在用户实际指定至少一个筛选字段时传递筛选参数。
+// 空筛选不应触发 SearchAction 中的筛选面板交互。
+func searchFilterOptions(input FilterOption) []xiaohongshu.FilterOption {
+	if input.SortBy == "" &&
+		input.NoteType == "" &&
+		input.PublishTime == "" &&
+		input.SearchScope == "" &&
+		input.Location == "" {
+		return nil
+	}
+
+	return []xiaohongshu.FilterOption{{
+		SortBy:      input.SortBy,
+		NoteType:    input.NoteType,
+		PublishTime: input.PublishTime,
+		SearchScope: input.SearchScope,
+		Location:    input.Location,
+	}}
 }
 
 // handleGetFeedDetail 处理获取Feed详情
