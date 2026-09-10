@@ -124,6 +124,7 @@ type homepageSearchProbeInput struct {
 
 type homepageSearchTriggerTarget struct {
 	Name       string
+	Selector   string
 	Expression string
 }
 
@@ -160,12 +161,14 @@ var homepageSearchTriggerEventTypes = map[string]struct{}{
 }
 
 var homepageSearchTriggerTargets = []homepageSearchTriggerTarget{
-	{Name: "input", Expression: `document.querySelector('input#search-input')`},
-	{Name: "input-box", Expression: `document.querySelector('div.input-box')`},
-	{Name: "header", Expression: `document.querySelector('header.mask-paper')`},
-	{Name: "app", Expression: `document.querySelector('#app')`},
-	{Name: "document", Expression: `document`},
-	{Name: "window", Expression: `window`},
+	{Name: "input", Selector: `input#search-input`},
+	{Name: "input-box", Selector: `div.input-box`},
+	{Name: "input-button", Selector: `div.input-button`},
+	{Name: "search-icon", Selector: `div.search-icon`},
+	{Name: "header", Selector: `header.mask-paper`},
+	{Name: "app", Selector: `#app`},
+	{Name: "document", Expression: `() => document`},
+	{Name: "window", Expression: `() => window`},
 }
 
 func summarizeHomepageSearchTriggerListeners(target string, listeners []*proto.DOMDebuggerEventListener) homepageSearchTriggerListenerSummary {
@@ -350,6 +353,55 @@ func logHomepageSearchTriggerStructure(snapshot homepageSearchProbeSnapshot) {
 		snapshot.SearchInput != nil, len(snapshot.InputBoxNodes))
 }
 
+func homepageSearchTriggerRemoteObject(page *rod.Page, target homepageSearchTriggerTarget) (object *proto.RuntimeRemoteObject, found bool, release func() error, err error) {
+	release = func() error { return nil }
+	if target.Selector != "" {
+		element, elementErr := page.Element(target.Selector)
+		if elementErr != nil {
+			return nil, false, release, elementErr
+		}
+		if element == nil || element.Object == nil || element.Object.ObjectID == "" {
+			return nil, false, release, nil
+		}
+		return element.Object, true, func() error {
+			return element.Release()
+		}, nil
+	}
+
+	if target.Expression == "" {
+		return nil, false, release, fmt.Errorf("target %s has no selector or expression", target.Name)
+	}
+	object, err = page.Evaluate(rod.Eval(target.Expression).ByObject())
+	if err != nil {
+		return nil, false, release, err
+	}
+	if object == nil || object.ObjectID == "" {
+		return nil, false, release, nil
+	}
+	return object, true, func() error {
+		return page.Release(object)
+	}, nil
+}
+
+func releaseHomepageSearchTriggerListenerObjects(page *rod.Page, listeners []*proto.DOMDebuggerEventListener) {
+	if page == nil {
+		return
+	}
+	for _, listener := range listeners {
+		if listener == nil {
+			continue
+		}
+		for _, object := range []*proto.RuntimeRemoteObject{listener.Handler, listener.OriginalHandler} {
+			if object == nil || object.ObjectID == "" {
+				continue
+			}
+			if err := page.Release(object); err != nil {
+				logrus.Warnf("homepage-search-trigger-probe: listener remote object release failed: %v", err)
+			}
+		}
+	}
+}
+
 func readHomepageSearchTriggerListeners(page *rod.Page, target homepageSearchTriggerTarget) (summary homepageSearchTriggerListenerSummary, found bool, err error) {
 	if page == nil {
 		return summary, false, fmt.Errorf("page is nil")
@@ -360,16 +412,17 @@ func readHomepageSearchTriggerListeners(page *rod.Page, target homepageSearchTri
 		}
 	}()
 
-	object, err := page.Evaluate(rod.Eval(target.Expression).ByObject())
+	object, found, release, err := homepageSearchTriggerRemoteObject(page, target)
 	if err != nil {
-		return summary, false, err
+		return summary, found, err
 	}
-	if object == nil || object.ObjectID == "" {
+	if !found {
 		return summary, false, nil
 	}
-	found = true
 	defer func() {
-		_ = (proto.RuntimeReleaseObject{ObjectID: object.ObjectID}).Call(page)
+		if releaseErr := release(); releaseErr != nil {
+			logrus.Warnf("homepage-search-trigger-probe: target=%s remote object release failed: %v", target.Name, releaseErr)
+		}
 	}()
 
 	result, err := (proto.DOMDebuggerGetEventListeners{ObjectID: object.ObjectID}).Call(page)
@@ -379,6 +432,7 @@ func readHomepageSearchTriggerListeners(page *rod.Page, target homepageSearchTri
 	if result == nil {
 		return summary, true, fmt.Errorf("listener result is empty")
 	}
+	defer releaseHomepageSearchTriggerListenerObjects(page, result.Listeners)
 	return summarizeHomepageSearchTriggerListeners(target.Name, result.Listeners), true, nil
 }
 

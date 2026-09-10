@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/go-rod/rod/lib/proto"
@@ -201,6 +202,34 @@ func TestHomepageSearchTriggerListenerSummaryDoesNotExposeHandlerSource(t *testi
 	formatted := fmt.Sprintf("%+v", summary)
 	require.NotContains(t, formatted, "secretHandler")
 	require.NotContains(t, formatted, "sensitive")
+}
+
+func TestHomepageSearchTriggerTargetsUseSafeRemoteObjectAcquisition(t *testing.T) {
+	targetsByName := make(map[string]homepageSearchTriggerTarget, len(homepageSearchTriggerTargets))
+	for _, target := range homepageSearchTriggerTargets {
+		targetsByName[target.Name] = target
+		if target.Selector != "" {
+			require.Empty(t, target.Expression, "%s should use Element.Object", target.Name)
+			continue
+		}
+		require.True(t, strings.HasPrefix(strings.TrimSpace(target.Expression), "() =>"),
+			"%s must use a callable Rod Eval function", target.Name)
+	}
+
+	for _, name := range []string{"input", "input-box", "input-button", "search-icon", "header", "app", "document", "window"} {
+		_, ok := targetsByName[name]
+		require.True(t, ok, "missing listener probe target %s", name)
+	}
+}
+
+func TestHomepageSearchTriggerListenerReleaseHelperIsBestEffort(t *testing.T) {
+	require.NotPanics(t, func() {
+		releaseHomepageSearchTriggerListenerObjects(nil, []*proto.DOMDebuggerEventListener{
+			{Handler: &proto.RuntimeRemoteObject{ObjectID: "handler"}},
+			{OriginalHandler: &proto.RuntimeRemoteObject{ObjectID: "original-handler"}},
+			nil,
+		})
+	})
 }
 
 func TestHomepageSearchProbeRecordsInlineHandlerFlagsWithoutReadingHandlers(t *testing.T) {
