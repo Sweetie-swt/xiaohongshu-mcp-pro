@@ -7,8 +7,10 @@ import (
 	"time"
 
 	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/proto"
 	"github.com/lisiyuan/xiaohongshu-mcp-pro/browser"
 	"github.com/stretchr/testify/require"
+	"github.com/ysmood/gson"
 )
 
 func TestSearch(t *testing.T) {
@@ -112,6 +114,148 @@ func TestFilterValidation(t *testing.T) {
 	internalFilters, err = convertToInternalFilters(allFilters)
 	require.NoError(t, err)
 	require.Len(t, internalFilters, 5)
+}
+
+func TestSearchNavigationTraceFiltersAndRecordsMainDocumentEvents(t *testing.T) {
+	trace := &searchNavigationTrace{
+		traceID:            "trace-test",
+		mainFrameID:        proto.PageFrameID("main-frame"),
+		documentRequestIDs: make(map[proto.NetworkRequestID]struct{}),
+	}
+	trace.handleRequestWillBeSent(&proto.NetworkRequestWillBeSent{
+		RequestID:   "document-request",
+		LoaderID:    "loader-1",
+		DocumentURL: "https://www.xiaohongshu.com/search_result?keyword=Kimi",
+		Request:     &proto.NetworkRequest{URL: "https://www.xiaohongshu.com/search_result?keyword=Kimi", Method: "GET"},
+		Type:        proto.NetworkResourceTypeDocument,
+		FrameID:     "main-frame",
+	})
+	trace.handleRequestWillBeSent(&proto.NetworkRequestWillBeSent{
+		RequestID: "image-request",
+		Request:   &proto.NetworkRequest{URL: "https://www.xiaohongshu.com/logo.png", Method: "GET"},
+		Type:      proto.NetworkResourceTypeImage,
+		FrameID:   "main-frame",
+	})
+	trace.handleRequestWillBeSent(&proto.NetworkRequestWillBeSent{
+		RequestID: "xhr-request",
+		Request:   &proto.NetworkRequest{URL: "https://www.xiaohongshu.com/api/sns/web/v1/search", Method: "GET"},
+		Type:      proto.NetworkResourceTypeXHR,
+		FrameID:   "main-frame",
+	})
+	trace.handleResponseReceived(&proto.NetworkResponseReceived{
+		RequestID: "document-request",
+		LoaderID:  "loader-1",
+		Type:      proto.NetworkResourceTypeDocument,
+		FrameID:   "main-frame",
+		Response: &proto.NetworkResponse{
+			URL:               "https://www.xiaohongshu.com/search_result?keyword=Kimi",
+			Status:            200,
+			StatusText:        "OK",
+			Protocol:          "h2",
+			MIMEType:          "text/html",
+			FromDiskCache:     false,
+			FromServiceWorker: false,
+			RemoteIPAddress:   "192.0.2.1",
+		},
+	})
+	trace.handleLoadingFailed(&proto.NetworkLoadingFailed{
+		RequestID: "document-request",
+		Type:      proto.NetworkResourceTypeDocument,
+		ErrorText: "net::ERR_FAILED",
+		Canceled:  true,
+	})
+	trace.handleLoadingFailed(&proto.NetworkLoadingFailed{
+		RequestID: "image-request",
+		Type:      proto.NetworkResourceTypeImage,
+		ErrorText: "image failure",
+	})
+
+	require.Equal(t, 1, trace.mainDocumentRequests)
+	require.Equal(t, 1, trace.mainDocumentResponses)
+	require.Equal(t, []int{200}, trace.mainDocumentResponseStatuses)
+	require.Equal(t, 1, trace.mainDocumentLoadingFailures)
+	require.Equal(t, []string{"net::ERR_FAILED"}, trace.mainDocumentFailureTexts)
+	require.Len(t, trace.documentRequestIDs, 1)
+}
+
+func TestSearchNavigationTraceRecordsFrameLifecycleAndExecutionContext(t *testing.T) {
+	trace := &searchNavigationTrace{
+		traceID:            "trace-test",
+		mainFrameID:        proto.PageFrameID("main-frame"),
+		documentRequestIDs: make(map[proto.NetworkRequestID]struct{}),
+	}
+	trace.handleFrameNavigated(&proto.PageFrameNavigated{Frame: &proto.PageFrame{
+		ID:             "main-frame",
+		LoaderID:       "loader-2",
+		URL:            "https://www.xiaohongshu.com/search_result?keyword=Kimi",
+		SecurityOrigin: "https://www.xiaohongshu.com",
+		MIMEType:       "text/html",
+	}})
+	trace.handleFrameNavigated(&proto.PageFrameNavigated{Frame: &proto.PageFrame{
+		ID:       "child-frame",
+		ParentID: "main-frame",
+		LoaderID: "child-loader",
+		URL:      "https://example.invalid/frame",
+	}})
+	trace.handleLifecycleEvent(&proto.PageLifecycleEvent{FrameID: "main-frame", LoaderID: "loader-2", Name: proto.PageLifecycleEventNameDOMContentLoaded})
+	trace.handleLifecycleEvent(&proto.PageLifecycleEvent{FrameID: "child-frame", LoaderID: "child-loader", Name: proto.PageLifecycleEventNameLoad})
+	trace.handleDOMContentEventFired(&proto.PageDomContentEventFired{})
+	trace.handleLoadEventFired(&proto.PageLoadEventFired{})
+	trace.handleExecutionContextCreated(&proto.RuntimeExecutionContextCreated{Context: &proto.RuntimeExecutionContextDescription{
+		ID:     7,
+		Origin: "https://www.xiaohongshu.com",
+		Name:   "",
+		AuxData: map[string]gson.JSON{
+			"frameId":   gson.New("main-frame"),
+			"isDefault": gson.New(true),
+		},
+	}})
+	trace.handleExecutionContextCreated(&proto.RuntimeExecutionContextCreated{Context: &proto.RuntimeExecutionContextDescription{
+		ID: 8,
+		AuxData: map[string]gson.JSON{
+			"frameId":   gson.New("child-frame"),
+			"isDefault": gson.New(true),
+		},
+	}})
+
+	require.Equal(t, 1, trace.mainFrameNavigations)
+	require.Equal(t, []string{"https://www.xiaohongshu.com/search_result?keyword=Kimi"}, trace.mainFrameNavigationURLs)
+	require.Equal(t, []proto.PageLifecycleEventName{proto.PageLifecycleEventNameDOMContentLoaded}, trace.mainFrameLifecycleNames)
+	require.True(t, trace.mainExecutionContextCreated)
+	require.True(t, trace.mainDefaultExecutionContextCreated)
+}
+
+func TestSearchNavigationTraceStopsListenerWithoutLeakingWaiter(t *testing.T) {
+	traceCtx, cancel := context.WithCancel(context.Background())
+	waitStarted := make(chan struct{})
+	trace := newSearchNavigationTraceController("trace-test", cancel, func() {
+		close(waitStarted)
+		<-traceCtx.Done()
+	})
+	<-waitStarted
+	trace.Stop()
+	trace.Stop()
+	select {
+	case <-trace.done:
+	default:
+		t.Fatal("trace listener is still running after Stop")
+	}
+}
+
+func TestSearchBrowserDiagnosticsContinueAfterIndependentFailure(t *testing.T) {
+	page := &rod.Page{}
+	calls := 0
+	diagnoseSearchBrowserStateWithRunner(
+		page,
+		"Navigate",
+		func(_ *rod.Page, _ time.Duration, _ func(*rod.Page) error) error {
+			calls++
+			return fmt.Errorf("diagnostic unavailable")
+		},
+		func(*rod.Page) error { return nil },
+		func(*rod.Page) error { return nil },
+	)
+	require.Equal(t, 2, calls, "Target and frame-tree diagnostics must be independent")
 }
 
 func TestRunSearchNavigationNavigateSuccess(t *testing.T) {

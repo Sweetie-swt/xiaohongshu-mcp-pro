@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/proto"
 	"github.com/lisiyuan/xiaohongshu-mcp-pro/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -179,10 +182,272 @@ func NewSearchAction(page *rod.Page) *SearchAction {
 }
 
 const (
-	searchNavigateTimeout    = 15 * time.Second
-	searchResultReadyTimeout = 40 * time.Second
-	searchTargetURLTimeout   = 800 * time.Millisecond
+	searchNavigateTimeout      = 15 * time.Second
+	searchResultReadyTimeout   = 40 * time.Second
+	searchTargetURLTimeout     = 800 * time.Millisecond
+	searchTraceSnapshotTimeout = 500 * time.Millisecond
 )
+
+var searchNavigationTraceCounter uint64
+
+type searchNavigationTrace struct {
+	traceID     string
+	mainFrameID proto.PageFrameID
+
+	initialFrameCaptured bool
+	initialFrameID       proto.PageFrameID
+	initialURL           string
+	initialLoaderID      proto.NetworkLoaderID
+
+	documentRequestIDs map[proto.NetworkRequestID]struct{}
+
+	mainDocumentRequests               int
+	mainDocumentResponses              int
+	mainDocumentLoadingFailures        int
+	mainFrameNavigations               int
+	mainFrameLifecycleEvents           int
+	mainExecutionContextCreated        bool
+	mainDefaultExecutionContextCreated bool
+	mainDocumentRequestURLs            []string
+	mainDocumentResponseStatuses       []int
+	mainDocumentFailureTexts           []string
+	mainFrameNavigationURLs            []string
+	mainFrameNavigationLoaderIDs       []proto.NetworkLoaderID
+	mainFrameLifecycleNames            []proto.PageLifecycleEventName
+
+	cancel   context.CancelFunc
+	done     chan struct{}
+	stopOnce sync.Once
+}
+
+func nextSearchNavigationTraceID() string {
+	return fmt.Sprintf("search-nav-%d", atomic.AddUint64(&searchNavigationTraceCounter, 1))
+}
+
+func newSearchNavigationTraceController(traceID string, cancel context.CancelFunc, wait func()) *searchNavigationTrace {
+	trace := &searchNavigationTrace{
+		traceID:            traceID,
+		documentRequestIDs: make(map[proto.NetworkRequestID]struct{}),
+		cancel:             cancel,
+		done:               make(chan struct{}),
+	}
+	trace.startListener(wait)
+	return trace
+}
+
+func (t *searchNavigationTrace) startListener(wait func()) {
+	if t == nil {
+		return
+	}
+	if t.done == nil {
+		t.done = make(chan struct{})
+	}
+	go func() {
+		defer close(t.done)
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.warnf("event listener panic recovered: %v", recovered)
+			}
+		}()
+		wait()
+	}()
+}
+
+func (t *searchNavigationTrace) infof(format string, args ...interface{}) {
+	if t == nil {
+		return
+	}
+	values := append([]interface{}{t.traceID}, args...)
+	logrus.Infof("search_feeds: navigation trace_id=%s "+format, values...)
+}
+
+func (t *searchNavigationTrace) warnf(format string, args ...interface{}) {
+	if t == nil {
+		return
+	}
+	values := append([]interface{}{t.traceID}, args...)
+	logrus.Warnf("search_feeds: navigation trace_id=%s "+format, values...)
+}
+
+func (t *searchNavigationTrace) Stop() {
+	if t == nil {
+		return
+	}
+	t.stopOnce.Do(func() {
+		if t.cancel != nil {
+			t.cancel()
+		}
+		if t.done != nil {
+			<-t.done
+		}
+		t.infof("trace stopped main_document_requests=%d main_document_responses=%d main_document_loading_failures=%d main_frame_navigations=%d main_frame_lifecycle_events=%d main_execution_context_created=%t main_default_execution_context_created=%t",
+			t.mainDocumentRequests, t.mainDocumentResponses, t.mainDocumentLoadingFailures,
+			t.mainFrameNavigations, t.mainFrameLifecycleEvents,
+			t.mainExecutionContextCreated, t.mainDefaultExecutionContextCreated)
+	})
+}
+
+func (t *searchNavigationTrace) isMainFrame(frameID proto.PageFrameID) bool {
+	return t != nil && frameID != "" && frameID == t.mainFrameID
+}
+
+func (t *searchNavigationTrace) handleRequestWillBeSent(event *proto.NetworkRequestWillBeSent) {
+	if event == nil || event.Type != proto.NetworkResourceTypeDocument || !t.isMainFrame(event.FrameID) || event.Request == nil {
+		return
+	}
+	t.documentRequestIDs[event.RequestID] = struct{}{}
+	t.mainDocumentRequests++
+	t.mainDocumentRequestURLs = append(t.mainDocumentRequestURLs, event.Request.URL)
+	t.infof("main document request url=%q method=%s frame_id=%s loader_id=%s document_url=%q timestamp=%v",
+		event.Request.URL, event.Request.Method, event.FrameID, event.LoaderID, event.DocumentURL, event.Timestamp)
+}
+
+func (t *searchNavigationTrace) handleResponseReceived(event *proto.NetworkResponseReceived) {
+	if event == nil || event.Type != proto.NetworkResourceTypeDocument || !t.isMainFrame(event.FrameID) || event.Response == nil {
+		return
+	}
+	t.mainDocumentResponses++
+	t.mainDocumentResponseStatuses = append(t.mainDocumentResponseStatuses, event.Response.Status)
+	t.infof("main document response url=%q status=%d status_text=%q protocol=%s mime_type=%s frame_id=%s loader_id=%s from_disk_cache=%t from_service_worker=%t remote_ip=%s",
+		event.Response.URL, event.Response.Status, event.Response.StatusText, event.Response.Protocol,
+		event.Response.MIMEType, event.FrameID, event.LoaderID, event.Response.FromDiskCache,
+		event.Response.FromServiceWorker, event.Response.RemoteIPAddress)
+}
+
+func (t *searchNavigationTrace) handleLoadingFailed(event *proto.NetworkLoadingFailed) {
+	if event == nil || event.Type != proto.NetworkResourceTypeDocument {
+		return
+	}
+	if _, ok := t.documentRequestIDs[event.RequestID]; !ok {
+		return
+	}
+	t.mainDocumentLoadingFailures++
+	t.mainDocumentFailureTexts = append(t.mainDocumentFailureTexts, event.ErrorText)
+	corsError := ""
+	if event.CorsErrorStatus != nil {
+		corsError = fmt.Sprintf("%s:%s", event.CorsErrorStatus.CorsError, event.CorsErrorStatus.FailedParameter)
+	}
+	t.warnf("main document loading failed request_id=%s error_text=%q canceled=%t blocked_reason=%s cors_error=%s",
+		event.RequestID, event.ErrorText, event.Canceled, event.BlockedReason, corsError)
+}
+
+func (t *searchNavigationTrace) handleFrameNavigated(event *proto.PageFrameNavigated) {
+	if event == nil || event.Frame == nil || event.Frame.ParentID != "" {
+		return
+	}
+	t.mainFrameID = event.Frame.ID
+	t.mainFrameNavigations++
+	t.mainFrameNavigationURLs = append(t.mainFrameNavigationURLs, event.Frame.URL)
+	t.mainFrameNavigationLoaderIDs = append(t.mainFrameNavigationLoaderIDs, event.Frame.LoaderID)
+	t.infof("main frame navigated frame_id=%s loader_id=%s url=%q security_origin=%q mime_type=%s",
+		event.Frame.ID, event.Frame.LoaderID, event.Frame.URL, event.Frame.SecurityOrigin, event.Frame.MIMEType)
+}
+
+func (t *searchNavigationTrace) handleDOMContentEventFired(event *proto.PageDomContentEventFired) {
+	if event == nil {
+		return
+	}
+	t.infof("main document DOMContentLoaded timestamp=%v", event.Timestamp)
+}
+
+func (t *searchNavigationTrace) handleLoadEventFired(event *proto.PageLoadEventFired) {
+	if event == nil {
+		return
+	}
+	t.infof("main document load timestamp=%v", event.Timestamp)
+}
+
+func (t *searchNavigationTrace) handleLifecycleEvent(event *proto.PageLifecycleEvent) {
+	if event == nil || !t.isMainFrame(event.FrameID) {
+		return
+	}
+	t.mainFrameLifecycleEvents++
+	t.mainFrameLifecycleNames = append(t.mainFrameLifecycleNames, event.Name)
+	t.infof("main-frame lifecycle name=%s frame_id=%s loader_id=%s timestamp=%v",
+		event.Name, event.FrameID, event.LoaderID, event.Timestamp)
+}
+
+func (t *searchNavigationTrace) handleExecutionContextCreated(event *proto.RuntimeExecutionContextCreated) {
+	if event == nil || event.Context == nil {
+		return
+	}
+	frameIDValue, ok := event.Context.AuxData["frameId"]
+	if !ok || proto.PageFrameID(frameIDValue.Str()) != t.mainFrameID {
+		return
+	}
+	defaultWorld := "unknown"
+	if value, ok := event.Context.AuxData["isDefault"]; ok {
+		defaultWorld = fmt.Sprintf("%t", value.Bool())
+	} else if value, ok := event.Context.AuxData["type"]; ok {
+		defaultWorld = fmt.Sprintf("%t", value.Str() == "default")
+	}
+	t.mainExecutionContextCreated = true
+	if defaultWorld == "true" {
+		t.mainDefaultExecutionContextCreated = true
+	}
+	t.infof("main frame execution context created context_id=%d frame_id=%s default_world=%s origin=%q name=%q",
+		event.Context.ID, frameIDValue.Str(), defaultWorld, event.Context.Origin, event.Context.Name)
+}
+
+func startSearchNavigationTrace(ctx context.Context, page *rod.Page) (trace *searchNavigationTrace, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if page == nil {
+		return nil, fmt.Errorf("page is nil")
+	}
+
+	traceCtx, cancel := context.WithCancel(ctx)
+	trace = &searchNavigationTrace{
+		traceID:            nextSearchNavigationTraceID(),
+		mainFrameID:        page.FrameID,
+		documentRequestIDs: make(map[proto.NetworkRequestID]struct{}),
+		cancel:             cancel,
+	}
+	setupOK := false
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			cancel()
+			trace = nil
+			err = fmt.Errorf("navigation trace setup panic: %v", recovered)
+			return
+		}
+		if !setupOK {
+			cancel()
+		}
+	}()
+
+	snapshotCtx, snapshotCancel := context.WithTimeout(ctx, searchTraceSnapshotTimeout)
+	snapshot, snapshotErr := proto.PageGetFrameTree{}.Call(page.Context(snapshotCtx))
+	snapshotCancel()
+	if snapshotErr != nil {
+		trace.warnf("initial frame snapshot unavailable: %v", snapshotErr)
+	} else if snapshot != nil && snapshot.FrameTree != nil && snapshot.FrameTree.Frame != nil {
+		frame := snapshot.FrameTree.Frame
+		trace.initialFrameCaptured = true
+		trace.initialFrameID = frame.ID
+		trace.initialURL = frame.URL
+		trace.initialLoaderID = frame.LoaderID
+		trace.mainFrameID = frame.ID
+		trace.infof("initial main frame frame_id=%s loader_id=%s url=%q", frame.ID, frame.LoaderID, frame.URL)
+	}
+
+	tracePage := page.Context(traceCtx)
+	wait := tracePage.EachEvent(
+		func(event *proto.NetworkRequestWillBeSent) { trace.handleRequestWillBeSent(event) },
+		func(event *proto.NetworkResponseReceived) { trace.handleResponseReceived(event) },
+		func(event *proto.NetworkLoadingFailed) { trace.handleLoadingFailed(event) },
+		func(event *proto.PageFrameNavigated) { trace.handleFrameNavigated(event) },
+		func(event *proto.PageDomContentEventFired) { trace.handleDOMContentEventFired(event) },
+		func(event *proto.PageLoadEventFired) { trace.handleLoadEventFired(event) },
+		func(event *proto.PageLifecycleEvent) { trace.handleLifecycleEvent(event) },
+		func(event *proto.RuntimeExecutionContextCreated) { trace.handleExecutionContextCreated(event) },
+	)
+	trace.startListener(wait)
+	setupOK = true
+	trace.infof("trace started main_frame_id=%s", trace.mainFrameID)
+	return trace, nil
+}
 
 func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...FilterOption) (feeds []Feed, err error) {
 	if ctx == nil {
@@ -206,10 +471,20 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 	searchURL := makeSearchURL(keyword)
 	logrus.Infof("search_feeds: keyword input end")
 
+	navigationTrace, traceErr := startSearchNavigationTrace(ctx, page)
+	if traceErr != nil {
+		logrus.Warnf("search_feeds: navigation trace unavailable: %v", traceErr)
+	} else {
+		defer navigationTrace.Stop()
+	}
+
 	phase = "navigate/search page"
 	logrus.Infof("search_feeds: navigate/search page start")
 	logrus.Infof("search_feeds: submit/search trigger start")
-	if err := runSearchNavigation(ctx, page, searchURL, diagnoseSearchNavigationFailure); err != nil {
+	diagnose := func(diagnosticPage *rod.Page, stage string, original any) {
+		diagnoseSearchNavigationFailureWithTrace(diagnosticPage, stage, original, navigationTrace)
+	}
+	if err := runSearchNavigation(ctx, page, searchURL, diagnose); err != nil {
 		return nil, err
 	}
 	logrus.Infof("search_feeds: submit/search trigger end")
@@ -218,7 +493,7 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 
 	phase = "search result ready"
 	if err := waitForSearchResultReady(ctx, page); err != nil {
-		diagnoseSearchNavigationFailure(page, "search-result-ready", err)
+		diagnoseSearchNavigationFailureWithTrace(page, "search-result-ready", err, navigationTrace)
 		return nil, err
 	}
 
@@ -434,7 +709,12 @@ func waitForSearchResultReadyWith(ctx context.Context, wait func(context.Context
 }
 
 func diagnoseSearchNavigationFailure(page *rod.Page, stage string, original any) {
+	diagnoseSearchNavigationFailureWithTrace(page, stage, original, nil)
+}
+
+func diagnoseSearchNavigationFailureWithTrace(page *rod.Page, stage string, original any, trace *searchNavigationTrace) {
 	diagnoseSearchNavigationFailureWithRunner(page, stage, original, runSearchPageDiagnostic)
+	diagnoseSearchBrowserState(page, stage, trace)
 }
 
 func diagnoseSearchNavigationFailureWithRunner(
@@ -510,6 +790,93 @@ func diagnoseSearchNavigationFailureWithRunner(
 	}); err != nil {
 		logrus.Warnf("search_feeds: navigation diagnostics stage=%s document eval unavailable: %v", stage, err)
 	}
+}
+
+func diagnoseSearchBrowserState(page *rod.Page, stage string, trace *searchNavigationTrace) {
+	diagnoseSearchBrowserStateWithRunner(
+		page,
+		stage,
+		runSearchPageDiagnostic,
+		func(diagnosticPage *rod.Page) error {
+			return readSearchTargetInfo(diagnosticPage, stage)
+		},
+		func(diagnosticPage *rod.Page) error {
+			return readSearchFrameTree(diagnosticPage, stage, trace)
+		},
+	)
+}
+
+func diagnoseSearchBrowserStateWithRunner(
+	page *rod.Page,
+	stage string,
+	runDiagnostic func(*rod.Page, time.Duration, func(*rod.Page) error) error,
+	readTarget func(*rod.Page) error,
+	readFrameTree func(*rod.Page) error,
+) {
+	if page == nil {
+		logrus.Warnf("search_feeds: browser diagnostics stage=%s skipped because page is nil", stage)
+		return
+	}
+
+	const browserDiagnosticTimeout = 800 * time.Millisecond
+	if err := runDiagnostic(page, browserDiagnosticTimeout, readTarget); err != nil {
+		logrus.Warnf("search_feeds: browser diagnostics stage=%s Target.getTargetInfo unavailable: %v", stage, err)
+	}
+	if err := runDiagnostic(page, browserDiagnosticTimeout, readFrameTree); err != nil {
+		logrus.Warnf("search_feeds: browser diagnostics stage=%s Page.getFrameTree unavailable: %v", stage, err)
+	}
+}
+
+func readSearchTargetInfo(page *rod.Page, stage string) error {
+	if page == nil || page.Browser() == nil {
+		return fmt.Errorf("browser is unavailable")
+	}
+	client := page.Browser().Context(page.GetContext())
+	result, err := (proto.TargetGetTargetInfo{TargetID: page.TargetID}).Call(client)
+	if err != nil {
+		return err
+	}
+	if result == nil || result.TargetInfo == nil {
+		return fmt.Errorf("target info is empty")
+	}
+	info := result.TargetInfo
+	logrus.Warnf("search_feeds: browser diagnostics stage=%s target url=%q type=%s title=%q attached=%t",
+		stage, info.URL, info.Type, info.Title, info.Attached)
+	return nil
+}
+
+func readSearchFrameTree(page *rod.Page, stage string, trace *searchNavigationTrace) error {
+	result, err := proto.PageGetFrameTree{}.Call(page)
+	if err != nil {
+		return err
+	}
+	if result == nil || result.FrameTree == nil || result.FrameTree.Frame == nil {
+		logrus.Warnf("search_feeds: browser diagnostics stage=%s main_frame_exists=false child_frame_count=0", stage)
+		return nil
+	}
+
+	mainFrame := result.FrameTree.Frame
+	transition := "unknown"
+	if trace != nil && trace.initialFrameCaptured {
+		switched := trace.initialURL == "about:blank" && mainFrame.URL != "about:blank" &&
+			mainFrame.LoaderID != "" && mainFrame.LoaderID != trace.initialLoaderID
+		transition = fmt.Sprintf("%t", switched)
+	}
+	logrus.Warnf("search_feeds: browser diagnostics stage=%s main_frame_exists=true frame_id=%s loader_id=%s url=%q security_origin=%q mime_type=%s child_frame_count=%d from_initial_about_blank_to_new_loader=%s",
+		stage, mainFrame.ID, mainFrame.LoaderID, mainFrame.URL, mainFrame.SecurityOrigin,
+		mainFrame.MIMEType, countSearchFrameChildren(result.FrameTree), transition)
+	return nil
+}
+
+func countSearchFrameChildren(tree *proto.PageFrameTree) int {
+	if tree == nil {
+		return 0
+	}
+	count := len(tree.ChildFrames)
+	for _, child := range tree.ChildFrames {
+		count += countSearchFrameChildren(child)
+	}
+	return count
 }
 
 func runSearchPageDiagnostic(page *rod.Page, timeout time.Duration, action func(*rod.Page) error) (err error) {
