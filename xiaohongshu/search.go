@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-rod/rod"
 	"github.com/lisiyuan/xiaohongshu-mcp-pro/errors"
+	"github.com/sirupsen/logrus"
 )
 
 type SearchResult struct {
@@ -165,17 +166,45 @@ func NewSearchAction(page *rod.Page) *SearchAction {
 	return &SearchAction{page: pp}
 }
 
-func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...FilterOption) ([]Feed, error) {
-	page := s.page.Context(ctx)
+func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...FilterOption) (feeds []Feed, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	phase := "start"
+	defer func() {
+		if ctx.Err() != nil {
+			logrus.Warnf("search_feeds: context ended during phase=%s error=%v", phase, ctx.Err())
+		}
+	}()
 
+	// Context() returns a clone; reapply the action timeout after deriving it so
+	// the 60-second page bound is not accidentally discarded.
+	page := s.page.Context(ctx).Timeout(60 * time.Second)
+	logSearchPageState(page, "before navigate")
+
+	phase = "keyword input"
+	logrus.Infof("search_feeds: keyword input start")
 	searchURL := makeSearchURL(keyword)
-	page.MustNavigate(searchURL)
-	page.MustWaitStable()
+	logrus.Infof("search_feeds: keyword input end")
 
+	phase = "navigate/search page"
+	logrus.Infof("search_feeds: navigate/search page start")
+	logrus.Infof("search_feeds: submit/search trigger start")
+	page.MustNavigate(searchURL)
+	logrus.Infof("search_feeds: submit/search trigger end")
+	page.MustWaitStable()
+	logSearchPageState(page, "navigate/search page end")
+	logrus.Infof("search_feeds: navigate/search page end")
+
+	phase = "wait result selector"
+	logrus.Infof("search_feeds: wait result selector start")
 	page.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
+	logrus.Infof("search_feeds: wait result selector end")
 
 	// 如果有筛选条件，则应用筛选
 	if len(filters) > 0 {
+		phase = "submit/search trigger"
+		logrus.Infof("search_feeds: submit/search trigger start")
 		// 将所有 FilterOption 转换为内部筛选选项
 		var allInternalFilters []internalFilterOption
 		for _, filter := range filters {
@@ -212,8 +241,11 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 		page.MustWaitStable()
 		// 重新等待 __INITIAL_STATE__ 更新
 		page.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
+		logrus.Infof("search_feeds: submit/search trigger end")
 	}
 
+	phase = "extract results"
+	logrus.Infof("search_feeds: extract results start")
 	result := page.MustEval(`() => {
 		if (window.__INITIAL_STATE__ &&
 		    window.__INITIAL_STATE__.search &&
@@ -228,15 +260,30 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 	}`).String()
 
 	if result == "" {
+		logrus.Infof("search_feeds: extract results end count=0")
 		return nil, errors.ErrNoFeeds
 	}
 
-	var feeds []Feed
 	if err := json.Unmarshal([]byte(result), &feeds); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal feeds: %w", err)
 	}
 
+	logrus.Infof("search_feeds: extract results end count=%d", len(feeds))
 	return feeds, nil
+}
+
+func logSearchPageState(page *rod.Page, stage string) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logrus.Warnf("search_feeds: page state unavailable at %s: %v", stage, recovered)
+		}
+	}()
+	info, err := page.Info()
+	if err != nil {
+		logrus.Warnf("search_feeds: page state unavailable at %s: %v", stage, err)
+		return
+	}
+	logrus.Infof("search_feeds: %s url=%s title=%s", stage, info.URL, info.Title)
 }
 
 func makeSearchURL(keyword string) string {

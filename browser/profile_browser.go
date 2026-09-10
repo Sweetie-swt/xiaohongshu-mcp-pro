@@ -1,6 +1,7 @@
 package browser
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,15 +20,18 @@ import (
 // ProfileBrowser 使用持久化 Chrome profile 目录的浏览器。
 // 相比 CDP cookie 注入，Chrome 原生 profile 能跨进程、跨子域正确保持会话。
 type ProfileBrowser struct {
-	browser    *rod.Browser
-	launcher   *launcher.Launcher
-	profileDir string
-	closed     bool
+	browser      *rod.Browser
+	launcher     *launcher.Launcher
+	profileDir   string
+	profileLease chan struct{}
+	closed       bool
 }
 
 var (
 	profileBrowserMu     sync.Mutex
 	activeProfileBrowser = make(map[string]int)
+	profileLeaseMu       sync.Mutex
+	profileLeases        = make(map[string]chan struct{})
 )
 
 var singletonFileNames = []string{
@@ -36,12 +40,44 @@ var singletonFileNames = []string{
 	"SingletonSocket",
 }
 
+const (
+	profileAcquireTimeout = 30 * time.Second
+	profileLaunchTimeout  = 30 * time.Second
+	profileCloseTimeout   = 5 * time.Second
+	profileExitTimeout    = 5 * time.Second
+)
+
 // NewProfileBrowser 创建带持久化 profile 目录的浏览器实例。
 // profileDir 在浏览器关闭后保留，下次启动自动加载已有 session。
 func NewProfileBrowser(headless bool, profileDir string, binPath string, proxy string) *ProfileBrowser {
+	ctx, cancel := context.WithTimeout(context.Background(), profileLaunchTimeout)
+	defer cancel()
+	b, err := NewProfileBrowserWithContext(ctx, headless, profileDir, binPath, proxy)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+// NewProfileBrowserWithContext 创建带持久化 profile 目录的浏览器实例，
+// 并让 profile 获取、Chrome 启动都受 ctx 控制。调用方必须调用 Close。
+func NewProfileBrowserWithContext(ctx context.Context, headless bool, profileDir string, binPath string, proxy string) (*ProfileBrowser, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	profileDir = normalizedProfileDir(profileDir)
-	profileBrowserMu.Lock()
-	defer profileBrowserMu.Unlock()
+	acquireCtx, acquireCancel := context.WithTimeout(ctx, profileAcquireTimeout)
+	lease, err := acquireProfileLease(acquireCtx, profileDir)
+	acquireCancel()
+	if err != nil {
+		return nil, fmt.Errorf("acquire Chrome profile lease %s: %w", profileDir, err)
+	}
+	releaseLease := true
+	defer func() {
+		if releaseLease {
+			releaseProfileLease(lease)
+		}
+	}()
 
 	logSingletonFiles(profileDir, "启动前")
 	logrus.Infof("创建持久化 Chrome profile: %s", profileDir)
@@ -49,18 +85,33 @@ func NewProfileBrowser(headless bool, profileDir string, binPath string, proxy s
 		logrus.Warnf("创建 profile 目录失败: %v", err)
 	}
 
-	l, url, err := launchProfile(headless, profileDir, binPath, proxy)
+	launchCtx, cancel := context.WithTimeout(ctx, profileLaunchTimeout)
+	defer cancel()
+	l, url, err := launchProfile(launchCtx, headless, profileDir, binPath, proxy)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-	b := rod.New().ControlURL(url).MustConnect()
+	b := rod.New().ControlURL(url)
+	err = b.Connect()
+	if err != nil {
+		logrus.Warnf("Chrome profile CDP 连接失败: profile_dir=%s error=%v", profileDir, err)
+		pid := l.PID()
+		l.Kill()
+		_ = waitProcessExit(pid, profileExitTimeout)
+		return nil, fmt.Errorf("connect Chrome profile browser: %w", err)
+	}
+	profileBrowserMu.Lock()
 	activeProfileBrowser[profileDir]++
+	profileBrowserMu.Unlock()
+	releaseLease = false
+	logrus.Infof("Chrome profile browser created: profile_dir=%s active=%d", profileDir, activeProfileBrowserCount(profileDir))
 
 	return &ProfileBrowser{
-		browser:    b,
-		launcher:   l,
-		profileDir: profileDir,
-	}
+		browser:      b,
+		launcher:     l,
+		profileDir:   profileDir,
+		profileLease: lease,
+	}, nil
 }
 
 func newProfileLauncher(headless bool, profileDir string, binPath string, proxy string) *launcher.Launcher {
@@ -79,8 +130,8 @@ func newProfileLauncher(headless bool, profileDir string, binPath string, proxy 
 	return l
 }
 
-func launchProfile(headless bool, profileDir string, binPath string, proxy string) (*launcher.Launcher, string, error) {
-	l := newProfileLauncher(headless, profileDir, binPath, proxy)
+func launchProfile(ctx context.Context, headless bool, profileDir string, binPath string, proxy string) (*launcher.Launcher, string, error) {
+	l := newProfileLauncher(headless, profileDir, binPath, proxy).Context(ctx)
 	url, err := l.Launch()
 	if err == nil {
 		return l, url, nil
@@ -90,8 +141,9 @@ func launchProfile(headless bool, profileDir string, binPath string, proxy strin
 	if !isStaleProfileLockError(err) {
 		return nil, "", err
 	}
-	if activeProfileBrowser[profileDir] > 0 {
-		logrus.Warnf("Chrome profile 锁错误但当前服务仍持有活跃浏览器，跳过清理: profile_dir=%s active=%d", profileDir, activeProfileBrowser[profileDir])
+	active := activeProfileBrowserCount(profileDir)
+	if active > 0 {
+		logrus.Warnf("Chrome profile 锁错误但当前服务仍持有活跃浏览器，跳过清理: profile_dir=%s active=%d", profileDir, active)
 		return nil, "", err
 	}
 
@@ -117,7 +169,7 @@ func launchProfile(headless bool, profileDir string, binPath string, proxy strin
 	logrus.Infof("已清理 stale Chrome singleton 文件: profile_dir=%s files=%s", profileDir, strings.Join(removed, ","))
 
 	logrus.Infof("Chrome profile 将进行一次 relaunch: profile_dir=%s", profileDir)
-	retryLauncher := newProfileLauncher(headless, profileDir, binPath, proxy)
+	retryLauncher := newProfileLauncher(headless, profileDir, binPath, proxy).Context(ctx)
 	retryURL, retryErr := retryLauncher.Launch()
 	if retryErr != nil {
 		return nil, "", fmt.Errorf("Chrome relaunch after stale profile lock cleanup failed: %w", retryErr)
@@ -260,9 +312,59 @@ func removeStaleSingletonFiles(profileDir string) ([]string, error) {
 	return removed, nil
 }
 
+func acquireProfileLease(ctx context.Context, profileDir string) (chan struct{}, error) {
+	profileLeaseMu.Lock()
+	lease, ok := profileLeases[profileDir]
+	if !ok {
+		lease = make(chan struct{}, 1)
+		lease <- struct{}{}
+		profileLeases[profileDir] = lease
+	}
+	profileLeaseMu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-lease:
+		logrus.Infof("Chrome profile lease acquired: profile_dir=%s", profileDir)
+		return lease, nil
+	}
+}
+
+func releaseProfileLease(lease chan struct{}) {
+	if lease == nil {
+		return
+	}
+	select {
+	case lease <- struct{}{}:
+	default:
+	}
+}
+
+func activeProfileBrowserCount(profileDir string) int {
+	profileBrowserMu.Lock()
+	defer profileBrowserMu.Unlock()
+	return activeProfileBrowser[profileDir]
+}
+
 // NewPage 创建启用 stealth 模式的新页面
 func (b *ProfileBrowser) NewPage() *rod.Page {
 	return stealth.MustPage(b.browser)
+}
+
+// NewPageWithContext 创建启用 stealth 模式的新页面，并把页面创建绑定到 ctx。
+func (b *ProfileBrowser) NewPageWithContext(ctx context.Context) (*rod.Page, error) {
+	if b == nil || b.browser == nil {
+		return nil, fmt.Errorf("Chrome profile browser is not available")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	page, err := stealth.Page(b.browser.Context(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("create Chrome profile page: %w", err)
+	}
+	return page, nil
 }
 
 // Close 关闭浏览器，等待 Chrome 进程完全退出后再返回。
@@ -273,41 +375,77 @@ func (b *ProfileBrowser) Close() {
 		return
 	}
 	profileBrowserMu.Lock()
-	defer profileBrowserMu.Unlock()
 	if b.closed {
+		profileBrowserMu.Unlock()
 		return
 	}
 	b.closed = true
-	pid := b.launcher.PID()
-	_ = b.browser.Close() // 忽略 error（Chrome 关闭时 CDP 连接会断开）
+	pid := 0
+	if b.launcher != nil {
+		pid = b.launcher.PID()
+	}
+	chrome := b.browser
+	l := b.launcher
+	profileDir := b.profileDir
+	lease := b.profileLease
+	profileBrowserMu.Unlock()
 
-	// 等待 Chrome 进程退出（检查 /proc/{pid}）
-	waitProcessExit(pid)
+	logrus.Infof("Chrome profile cleanup start: profile_dir=%s", profileDir)
+	closeCtx, cancel := context.WithTimeout(context.Background(), profileCloseTimeout)
+	closeErr := closeRodBrowser(chrome, closeCtx)
+	cancel()
+	if closeErr != nil {
+		logrus.Warnf("Chrome profile CDP close failed: profile_dir=%s error=%v", profileDir, closeErr)
+		if l != nil {
+			l.Kill()
+		}
+	}
+	if !waitProcessExit(pid, profileExitTimeout) && l != nil {
+		logrus.Warnf("Chrome 进程 %d 未在 %s 内退出，强制结束", pid, profileExitTimeout)
+		l.Kill()
+		_ = waitProcessExit(pid, time.Second)
+	}
+
+	profileBrowserMu.Lock()
 	if activeProfileBrowser[b.profileDir] > 0 {
 		activeProfileBrowser[b.profileDir]--
 		if activeProfileBrowser[b.profileDir] == 0 {
 			delete(activeProfileBrowser, b.profileDir)
 		}
 	}
+	active := activeProfileBrowser[b.profileDir]
+	profileBrowserMu.Unlock()
+	releaseProfileLease(lease)
+	logrus.Infof("Chrome profile cleanup end: profile_dir=%s active=%d", profileDir, active)
 }
 
-// waitProcessExit 轮询 /proc/{pid} 直到 Chrome 进程退出（最多等 15 秒）。
-// 超时后强制 SIGKILL，确保 profile SingletonLock 被释放。
-func waitProcessExit(pid int) {
+func closeRodBrowser(b *rod.Browser, ctx context.Context) (err error) {
+	if b == nil {
+		return nil
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("close Chrome browser panic: %v", recovered)
+		}
+	}()
+	return b.Context(ctx).Close()
+}
+
+// waitProcessExit 轮询 /proc/{pid} 直到 Chrome 进程退出。
+func waitProcessExit(pid int, timeout time.Duration) bool {
 	if pid <= 0 {
-		return
+		return true
+	}
+	if runtime.GOOS != "linux" {
+		return true
 	}
 	procPath := fmt.Sprintf("/proc/%d", pid)
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(procPath); os.IsNotExist(err) {
-			return // 进程已退出
+			return true
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	// 超时：强制杀掉，否则下次启动同一 profile 会遇到 SingletonLock 冲突
-	logrus.Warnf("Chrome 进程 %d 未在 15s 内退出，强制 SIGKILL", pid)
-	if p, err := os.FindProcess(pid); err == nil {
-		_ = p.Kill()
-	}
+	return false
 }

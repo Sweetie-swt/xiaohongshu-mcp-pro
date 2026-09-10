@@ -10,6 +10,7 @@ import (
 	"github.com/go-rod/rod"
 	"github.com/lisiyuan/xiaohongshu-mcp-pro/browser"
 	"github.com/lisiyuan/xiaohongshu-mcp-pro/xiaohongshu"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestCreatorPhoneLoginSessionRetention(t *testing.T) {
@@ -256,5 +257,146 @@ func TestHandleCreatorVerifyOTPSecurityVerificationReturnsScreenshot(t *testing.
 	}
 	if !strings.Contains(result.Content[0].Text, "security_verification_required") {
 		t.Fatalf("missing security verification status: %q", result.Content[0].Text)
+	}
+}
+
+func TestWithProfileBrowserPageCleansUpAfterSuccessErrorTimeoutCancelAndPanic(t *testing.T) {
+	originalFactory := profileBrowserPageFactory
+	originalPageCloser := profilePageCloser
+	originalBrowserCloser := profileBrowserCloser
+	t.Cleanup(func() {
+		profileBrowserPageFactory = originalFactory
+		profilePageCloser = originalPageCloser
+		profileBrowserCloser = originalBrowserCloser
+	})
+
+	tests := []struct {
+		name      string
+		timeout   time.Duration
+		parentCtx func() (context.Context, context.CancelFunc)
+		callback  func(context.Context, *rod.Page) error
+		wantErr   bool
+	}{
+		{
+			name: "success",
+			parentCtx: func() (context.Context, context.CancelFunc) {
+				return context.Background(), func() {}
+			},
+			callback: func(context.Context, *rod.Page) error { return nil },
+		},
+		{
+			name: "error",
+			parentCtx: func() (context.Context, context.CancelFunc) {
+				return context.Background(), func() {}
+			},
+			callback: func(context.Context, *rod.Page) error { return fmt.Errorf("expected action error") },
+			wantErr:  true,
+		},
+		{
+			name:    "timeout",
+			timeout: 20 * time.Millisecond,
+			parentCtx: func() (context.Context, context.CancelFunc) {
+				return context.Background(), func() {}
+			},
+			callback: func(ctx context.Context, _ *rod.Page) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+			wantErr: true,
+		},
+		{
+			name: "cancellation",
+			parentCtx: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, func() {}
+			},
+			callback: func(ctx context.Context, _ *rod.Page) error {
+				return ctx.Err()
+			},
+			wantErr: true,
+		},
+		{
+			name: "panic becomes error",
+			parentCtx: func() (context.Context, context.CancelFunc) {
+				return context.Background(), func() {}
+			},
+			callback: func(context.Context, *rod.Page) error { panic("expected browser action panic") },
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeBrowser := &browser.ProfileBrowser{}
+			fakePage := &rod.Page{}
+			pageClosed := false
+			browserClosed := false
+			profileBrowserPageFactory = func(context.Context) (*browser.ProfileBrowser, *rod.Page, error) {
+				return fakeBrowser, fakePage, nil
+			}
+			profilePageCloser = func(*rod.Page, context.Context) error {
+				pageClosed = true
+				return nil
+			}
+			profileBrowserCloser = func(*browser.ProfileBrowser) { browserClosed = true }
+
+			ctx, cancel := tt.parentCtx()
+			defer cancel()
+			timeout := tt.timeout
+			if timeout == 0 {
+				timeout = time.Second
+			}
+			err := withProfileBrowserPage(ctx, "test_profile_read", timeout, tt.callback)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("withProfileBrowserPage() error=%v, wantErr=%t", err, tt.wantErr)
+			}
+			if !pageClosed || !browserClosed {
+				t.Fatalf("cleanup flags: pageClosed=%t browserClosed=%t", pageClosed, browserClosed)
+			}
+		})
+	}
+}
+
+func TestHandleSearchFeedsLaunchFailureReturnsToolError(t *testing.T) {
+	originalFactory := profileBrowserPageFactory
+	t.Cleanup(func() { profileBrowserPageFactory = originalFactory })
+	profileBrowserPageFactory = func(context.Context) (*browser.ProfileBrowser, *rod.Page, error) {
+		return nil, nil, fmt.Errorf("Chrome profile launch failed")
+	}
+
+	appServer := &AppServer{xiaohongshuService: &XiaohongshuService{}}
+	result := appServer.handleSearchFeeds(context.Background(), SearchFeedsArgs{Keyword: "test"})
+	if !result.IsError {
+		t.Fatal("expected browser launch failure to be returned as a tool error")
+	}
+	if !strings.Contains(result.Content[0].Text, "Chrome profile launch failed") {
+		t.Fatalf("missing launch error text: %#v", result.Content)
+	}
+}
+
+func TestMCPToolRegistrationCount(t *testing.T) {
+	server := InitMCPServer(&AppServer{xiaohongshuService: &XiaohongshuService{}})
+	client := mcp.NewClient(&mcp.Implementation{Name: "registration-test", Version: "test"}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSession.Close()
+
+	result, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(result.Tools); got != 21 {
+		t.Fatalf("registered MCP tools=%d, want 21", got)
 	}
 }

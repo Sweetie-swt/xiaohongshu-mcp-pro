@@ -112,15 +112,13 @@ func (s *XiaohongshuService) DeleteCookies(ctx context.Context) error {
 
 // CheckLoginStatus 检查登录状态
 func (s *XiaohongshuService) CheckLoginStatus(ctx context.Context) (*LoginStatusResponse, error) {
-	b := newProfileBrowser()
-	defer b.Close()
-
-	page := b.NewPage()
-	defer page.Close()
-
-	loginAction := xiaohongshu.NewLogin(page)
-
-	isLoggedIn, err := loginAction.CheckLoginStatus(ctx)
+	var isLoggedIn bool
+	err := withProfileBrowserPage(ctx, "check_login_status", 90*time.Second, func(actionCtx context.Context, page *rod.Page) error {
+		loginAction := xiaohongshu.NewLogin(page)
+		var err error
+		isLoggedIn, err = loginAction.CheckLoginStatus(actionCtx)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -396,17 +394,15 @@ func (s *XiaohongshuService) publishVideo(ctx context.Context, content xiaohongs
 
 // ListFeeds 获取Feeds列表
 func (s *XiaohongshuService) ListFeeds(ctx context.Context) (*FeedsListResponse, error) {
-	b := newProfileBrowser()
-	defer b.Close()
-
-	page := b.NewPage()
-	defer page.Close()
-
-	// 创建 Feeds 列表 action
-	action := xiaohongshu.NewFeedsListAction(page)
-
-	// 获取 Feeds 列表
-	feeds, err := action.GetFeedsList(ctx)
+	var feeds []xiaohongshu.Feed
+	err := withProfileBrowserPage(ctx, "list_feeds", profileReadTimeout, func(actionCtx context.Context, page *rod.Page) error {
+		// 创建 Feeds 列表 action
+		action := xiaohongshu.NewFeedsListAction(page)
+		// 获取 Feeds 列表
+		var err error
+		feeds, err = action.GetFeedsList(actionCtx)
+		return err
+	})
 	if err != nil {
 		logrus.Errorf("获取 Feeds 列表失败: %v", err)
 		return nil, err
@@ -421,15 +417,13 @@ func (s *XiaohongshuService) ListFeeds(ctx context.Context) (*FeedsListResponse,
 }
 
 func (s *XiaohongshuService) SearchFeeds(ctx context.Context, keyword string, filters ...xiaohongshu.FilterOption) (*FeedsListResponse, error) {
-	b := newProfileBrowser()
-	defer b.Close()
-
-	page := b.NewPage()
-	defer page.Close()
-
-	action := xiaohongshu.NewSearchAction(page)
-
-	feeds, err := action.Search(ctx, keyword, filters...)
+	var feeds []xiaohongshu.Feed
+	err := withProfileBrowserPage(ctx, "search_feeds", profileReadTimeout, func(actionCtx context.Context, page *rod.Page) error {
+		action := xiaohongshu.NewSearchAction(page)
+		var err error
+		feeds, err = action.Search(actionCtx, keyword, filters...)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -449,17 +443,15 @@ func (s *XiaohongshuService) GetFeedDetail(ctx context.Context, feedID, xsecToke
 
 // GetFeedDetailWithConfig 使用配置获取Feed详情
 func (s *XiaohongshuService) GetFeedDetailWithConfig(ctx context.Context, feedID, xsecToken string, loadAllComments bool, config xiaohongshu.CommentLoadConfig) (*FeedDetailResponse, error) {
-	b := newProfileBrowser()
-	defer b.Close()
-
-	page := b.NewPage()
-	defer page.Close()
-
-	// 创建 Feed 详情 action
-	action := xiaohongshu.NewFeedDetailAction(page)
-
-	// 获取 Feed 详情
-	result, err := action.GetFeedDetailWithConfig(ctx, feedID, xsecToken, loadAllComments, config)
+	var result *xiaohongshu.FeedDetailResponse
+	err := withProfileBrowserPage(ctx, "get_feed_detail", feedDetailTimeout, func(actionCtx context.Context, page *rod.Page) error {
+		// 创建 Feed 详情 action
+		action := xiaohongshu.NewFeedDetailAction(page)
+		// 获取 Feed 详情
+		var err error
+		result, err = action.GetFeedDetailWithConfig(actionCtx, feedID, xsecToken, loadAllComments, config)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -474,15 +466,13 @@ func (s *XiaohongshuService) GetFeedDetailWithConfig(ctx context.Context, feedID
 
 // UserProfile 获取用户信息
 func (s *XiaohongshuService) UserProfile(ctx context.Context, userID, xsecToken string) (*UserProfileResponse, error) {
-	b := newProfileBrowser()
-	defer b.Close()
-
-	page := b.NewPage()
-	defer page.Close()
-
-	action := xiaohongshu.NewUserProfileAction(page)
-
-	result, err := action.UserProfile(ctx, userID, xsecToken)
+	var result *xiaohongshu.UserProfileResponse
+	err := withProfileBrowserPage(ctx, "user_profile", profileReadTimeout, func(actionCtx context.Context, page *rod.Page) error {
+		action := xiaohongshu.NewUserProfileAction(page)
+		var err error
+		result, err = action.UserProfile(actionCtx, userID, xsecToken)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -601,6 +591,14 @@ func (s *XiaohongshuService) ReplyCommentToFeed(ctx context.Context, feedID, xse
 func newProfileBrowser() *browser.ProfileBrowser {
 	profileDir := accounts.GetManager().GetActiveProfileDir()
 	return browser.NewProfileBrowser(configs.IsHeadless(), profileDir, configs.GetBinPath(), os.Getenv("XHS_PROXY"))
+}
+
+func newProfileBrowserWithContext(ctx context.Context) (*browser.ProfileBrowser, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	profileDir := accounts.GetManager().GetActiveProfileDir()
+	return browser.NewProfileBrowserWithContext(ctx, configs.IsHeadless(), profileDir, configs.GetBinPath(), os.Getenv("XHS_PROXY"))
 }
 
 // newProfileBrowserForAccount 使用指定账号的 Chrome profile 目录创建浏览器（广播发布时使用）
@@ -823,15 +821,81 @@ func saveCookies(page *rod.Page) error {
 	return cookies.NewLoadCookie(cookiePath).SaveCookies(data)
 }
 
-// withBrowserPage 执行需要浏览器页面的操作的通用函数
-func withBrowserPage(fn func(*rod.Page) error) error {
-	b := newProfileBrowser()
-	defer b.Close()
+const (
+	profileReadTimeout = 2 * time.Minute
+	feedDetailTimeout  = 4 * time.Minute
+)
 
-	page := b.NewPage()
-	defer page.Close()
+var (
+	profileBrowserPageFactory = func(ctx context.Context) (*browser.ProfileBrowser, *rod.Page, error) {
+		b, err := newProfileBrowserWithContext(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		page, err := b.NewPageWithContext(ctx)
+		if err != nil {
+			b.Close()
+			return nil, nil, err
+		}
+		return b, page, nil
+	}
+	profilePageCloser    = closeProfilePage
+	profileBrowserCloser = func(b *browser.ProfileBrowser) { b.Close() }
+)
 
-	return fn(page)
+// withProfileBrowserPage 为读取型 profile browser 提供统一的 deadline、panic
+// 转 error 和 best-effort cleanup。cleanup 使用独立 context，避免操作 context
+// 取消后关闭页面/浏览器也被一并取消。
+func withProfileBrowserPage(ctx context.Context, operation string, timeout time.Duration, fn func(context.Context, *rod.Page) error) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	opCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	logrus.Infof("%s: browser create start", operation)
+	b, page, err := profileBrowserPageFactory(opCtx)
+	if err != nil {
+		if b != nil {
+			profileBrowserCloser(b)
+		}
+		if opCtx.Err() != nil {
+			return fmt.Errorf("%s browser create: %w", operation, opCtx.Err())
+		}
+		return fmt.Errorf("%s browser create: %w", operation, err)
+	}
+	logrus.Infof("%s: browser created", operation)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("%s panic: %v", operation, recovered)
+			logrus.Errorf("%s: panic converted to error: %v", operation, recovered)
+		}
+		logrus.Infof("%s: cleanup start", operation)
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if closeErr := profilePageCloser(page, cleanupCtx); closeErr != nil {
+			logrus.Warnf("%s: page cleanup failed: %v", operation, closeErr)
+		}
+		cleanupCancel()
+		profileBrowserCloser(b)
+		logrus.Infof("%s: cleanup end", operation)
+	}()
+
+	err = fn(opCtx, page)
+	if err == nil && opCtx.Err() != nil {
+		err = fmt.Errorf("%s: %w", operation, opCtx.Err())
+	}
+	return err
+}
+
+func closeProfilePage(page *rod.Page, ctx context.Context) (err error) {
+	if page == nil {
+		return nil
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("close Chrome page panic: %v", recovered)
+		}
+	}()
+	return page.Context(ctx).Close()
 }
 
 // GetMyProfile 获取当前登录用户的个人信息
@@ -839,9 +903,9 @@ func (s *XiaohongshuService) GetMyProfile(ctx context.Context) (*UserProfileResp
 	var result *xiaohongshu.UserProfileResponse
 	var err error
 
-	err = withBrowserPage(func(page *rod.Page) error {
+	err = withProfileBrowserPage(ctx, "get_my_profile", profileReadTimeout, func(actionCtx context.Context, page *rod.Page) error {
 		action := xiaohongshu.NewUserProfileAction(page)
-		result, err = action.GetMyProfileViaSidebar(ctx)
+		result, err = action.GetMyProfileViaSidebar(actionCtx)
 		return err
 	})
 
