@@ -182,7 +182,10 @@ func NewSearchAction(page *rod.Page) *SearchAction {
 }
 
 const (
-	searchHomepageURL          = "https://www.xiaohongshu.com"
+	// The site root currently redirects to /explore. Starting from the
+	// canonical consumer document avoids adding a redirect hop before the
+	// search controls and their execution context are ready.
+	searchHomepageURL          = "https://www.xiaohongshu.com/explore"
 	searchInputSelector        = "input#search-input"
 	searchIconSelector         = "div.search-icon"
 	searchHomepageTimeout      = 60 * time.Second
@@ -953,9 +956,6 @@ func bootstrapSearchHomepage(ctx context.Context, page *rod.Page) error {
 			return page.Context(stageCtx).Navigate(targetURL)
 		},
 		func(stageCtx context.Context) error {
-			return page.Context(stageCtx).WaitDOMStable(time.Second, 0)
-		},
-		func(stageCtx context.Context) error {
 			return page.Context(stageCtx).Wait(rod.Eval(searchHomepageReadyScript))
 		},
 	)
@@ -964,13 +964,12 @@ func bootstrapSearchHomepage(ctx context.Context, page *rod.Page) error {
 func bootstrapSearchHomepageWith(
 	ctx context.Context,
 	navigate func(context.Context, string) error,
-	waitDOMStable func(context.Context) error,
 	waitReady func(context.Context) error,
 ) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if navigate == nil || waitDOMStable == nil || waitReady == nil {
+	if navigate == nil || waitReady == nil {
 		return fmt.Errorf("homepage bootstrap failed: incomplete stage operation")
 	}
 	homepageCtx, cancel := context.WithTimeout(ctx, searchHomepageTimeout)
@@ -982,12 +981,6 @@ func bootstrapSearchHomepageWith(
 			return fmt.Errorf("homepage bootstrap timeout: %w", homepageCtx.Err())
 		}
 		return fmt.Errorf("homepage navigation failed: %w", err)
-	}
-	if err := waitDOMStable(homepageCtx); err != nil {
-		if homepageCtx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("homepage bootstrap timeout: %w", homepageCtx.Err())
-		}
-		return fmt.Errorf("homepage DOM ready failed: %w", err)
 	}
 	if err := waitReady(homepageCtx); err != nil {
 		if homepageCtx.Err() == context.DeadlineExceeded {

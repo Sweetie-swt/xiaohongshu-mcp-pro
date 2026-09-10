@@ -259,7 +259,7 @@ func TestSearchBrowserDiagnosticsContinueAfterIndependentFailure(t *testing.T) {
 }
 
 func TestBootstrapSearchHomepageUsesHomepageBeforeControls(t *testing.T) {
-	steps := make([]string, 0, 3)
+	steps := make([]string, 0, 2)
 	err := bootstrapSearchHomepageWith(
 		context.Background(),
 		func(stageCtx context.Context, targetURL string) error {
@@ -269,18 +269,13 @@ func TestBootstrapSearchHomepageUsesHomepageBeforeControls(t *testing.T) {
 			return nil
 		},
 		func(context.Context) error {
-			steps = append(steps, "dom-stable")
-			return nil
-		},
-		func(context.Context) error {
 			steps = append(steps, "homepage-ready")
 			return nil
 		},
 	)
 	require.NoError(t, err)
 	require.Equal(t, []string{
-		"navigate:https://www.xiaohongshu.com",
-		"dom-stable",
+		"navigate:https://www.xiaohongshu.com/explore",
 		"homepage-ready",
 	}, steps)
 }
