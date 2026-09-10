@@ -278,77 +278,156 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 	return feeds, nil
 }
 
-func runSearchNavigation(page *rod.Page, searchURL string, diagnose func(*rod.Page, any)) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
+func runSearchNavigation(page *rod.Page, searchURL string, diagnose func(*rod.Page, string, any)) {
+	runSearchNavigationPhases(
+		func() { page.MustNavigate(searchURL) },
+		func() { page.MustWaitStable() },
+		func(stage string, original any) {
 			// Diagnostics are best-effort. Swallow a diagnostic panic so the
-			// original navigation panic remains the error seen by the service.
+			// original staged navigation panic remains the error seen by the service.
 			if diagnose != nil {
 				func() {
 					defer func() { _ = recover() }()
-					diagnose(page, recovered)
+					diagnose(page, stage, original)
 				}()
 			}
-			panic(recovered)
-		}
-	}()
-	page.MustNavigate(searchURL)
-	page.MustWaitStable()
+			panicSearchNavigationFailure(stage, original)
+		},
+	)
 }
 
-func diagnoseSearchNavigationFailure(page *rod.Page, original any) {
-	logrus.Warnf("search_feeds: navigation failed, original=%v", original)
+func runSearchNavigationPhases(navigate func(), waitStable func(), onFailure func(string, any)) {
+	runSearchNavigationPhase("MustNavigate", navigate, onFailure)
+	runSearchNavigationPhase("MustWaitStable", waitStable, onFailure)
+}
+
+func runSearchNavigationPhase(stage string, action func(), onFailure func(string, any)) {
+	logrus.Infof("search_feeds: %s start", stage)
+	defer func() {
+		if original := recover(); original != nil {
+			if onFailure != nil {
+				onFailure(stage, original)
+			}
+			panicSearchNavigationFailure(stage, original)
+		}
+	}()
+	action()
+	logrus.Infof("search_feeds: %s end", stage)
+}
+
+func panicSearchNavigationFailure(stage string, original any) {
+	if err, ok := original.(error); ok {
+		panic(fmt.Errorf("navigation %s failed: %w", stage, err))
+	}
+	panic(fmt.Errorf("navigation %s failed: %v", stage, original))
+}
+
+func diagnoseSearchNavigationFailure(page *rod.Page, stage string, original any) {
+	diagnoseSearchNavigationFailureWithRunner(page, stage, original, runSearchPageDiagnostic)
+}
+
+func diagnoseSearchNavigationFailureWithRunner(
+	page *rod.Page,
+	stage string,
+	original any,
+	runDiagnostic func(*rod.Page, time.Duration, func(*rod.Page) error) error,
+) {
+	logrus.Warnf("search_feeds: navigation failed stage=%s original=%v", stage, original)
 	if page == nil {
-		logrus.Warn("search_feeds: navigation diagnostics skipped because page is nil")
+		logrus.Warnf("search_feeds: navigation diagnostics stage=%s skipped because page is nil", stage)
 		return
 	}
 
-	const diagnosticTimeout = 800 * time.Millisecond
-	diagnosticCtx, cancel := context.WithTimeout(context.Background(), diagnosticTimeout)
+	// Each diagnostic group gets a fresh context rooted at Background. This is
+	// deliberate: the action page context may already be deadline-exceeded.
+	const (
+		urlTitleDiagnosticTimeout = 800 * time.Millisecond
+		documentDiagnosticTimeout = 1500 * time.Millisecond
+	)
+
+	if err := runDiagnostic(page, urlTitleDiagnosticTimeout, func(diagnosticPage *rod.Page) error {
+		info, err := diagnosticPage.Info()
+		if err != nil {
+			return err
+		}
+		logrus.Warnf("search_feeds: navigation diagnostics stage=%s url=%s title=%s", stage, info.URL, info.Title)
+		return nil
+	}); err != nil {
+		logrus.Warnf("search_feeds: navigation diagnostics stage=%s URL/title unavailable: %v", stage, err)
+	}
+
+	if err := runDiagnostic(page, documentDiagnosticTimeout, func(diagnosticPage *rod.Page) error {
+		result, err := diagnosticPage.Eval(`() => {
+			const bodyExists = document.body !== null;
+			const bodyText = bodyExists ? (document.body.innerText || document.body.textContent || '') : '';
+			const featureText = bodyText.slice(0, 4000);
+			const host = window.location.hostname || '';
+			return JSON.stringify({
+				location_href: String(window.location.href || ''),
+				title: String(document.title || ''),
+				ready_state: String(document.readyState || ''),
+				body_exists: bodyExists,
+				body_text_length: bodyText.length,
+				is_about_blank: window.location.href === 'about:blank',
+				is_xiaohongshu: /xiaohongshu\.com$/.test(host),
+				has_login_text: /登录|验证码|手机号/.test(featureText),
+				has_verification_text: /安全验证|扫码|风控|验证/.test(featureText)
+			});
+		}`)
+		if err != nil {
+			return err
+		}
+
+		var state struct {
+			LocationHref        string `json:"location_href"`
+			Title               string `json:"title"`
+			ReadyState          string `json:"ready_state"`
+			BodyExists          bool   `json:"body_exists"`
+			BodyTextLength      int    `json:"body_text_length"`
+			IsAboutBlank        bool   `json:"is_about_blank"`
+			IsXiaohongshu       bool   `json:"is_xiaohongshu"`
+			HasLoginText        bool   `json:"has_login_text"`
+			HasVerificationText bool   `json:"has_verification_text"`
+		}
+		if err := json.Unmarshal([]byte(result.Value.Str()), &state); err != nil {
+			return fmt.Errorf("parse document diagnostics: %w", err)
+		}
+		logrus.Warnf("search_feeds: navigation diagnostics stage=%s document ready_state=%s location_href=%s title=%s body_exists=%t body_text_length=%d about_blank=%t xiaohongshu=%t login_text=%t verification_text=%t",
+			stage, state.ReadyState, state.LocationHref, state.Title, state.BodyExists, state.BodyTextLength,
+			state.IsAboutBlank, state.IsXiaohongshu, state.HasLoginText, state.HasVerificationText)
+		return nil
+	}); err != nil {
+		logrus.Warnf("search_feeds: navigation diagnostics stage=%s document eval unavailable: %v", stage, err)
+	}
+}
+
+func runSearchPageDiagnostic(page *rod.Page, timeout time.Duration, action func(*rod.Page) error) (err error) {
+	return runSearchPageDiagnosticWithPageContext(page, timeout, func(page *rod.Page, ctx context.Context) *rod.Page {
+		return page.Context(ctx)
+	}, action)
+}
+
+func runSearchPageDiagnosticWithPageContext(
+	page *rod.Page,
+	timeout time.Duration,
+	cloneWithContext func(*rod.Page, context.Context) *rod.Page,
+	action func(*rod.Page) error,
+) (err error) {
+	if page == nil {
+		return fmt.Errorf("page is nil")
+	}
+	defer func() {
+		if original := recover(); original != nil {
+			err = fmt.Errorf("diagnostic panic: %v", original)
+		}
+	}()
+
+	diagnosticCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	diagnosticPage := page.Context(diagnosticCtx).Timeout(diagnosticTimeout)
-
-	if info, err := diagnosticPage.Info(); err != nil {
-		logrus.Warnf("search_feeds: navigation diagnostics URL/title unavailable: %v", err)
-	} else {
-		logrus.Warnf("search_feeds: navigation diagnostics url=%s title=%s", info.URL, info.Title)
-	}
-
-	result, err := diagnosticPage.Eval(`() => {
-		const body = (document.body && (document.body.innerText || document.body.textContent) || '').slice(0, 4000);
-		return JSON.stringify({
-			url: String(window.location.href || ''),
-			title: String(document.title || ''),
-			ready_state: String(document.readyState || ''),
-			is_about_blank: window.location.href === 'about:blank',
-			is_xiaohongshu: /xiaohongshu\.com$/.test(window.location.hostname || ''),
-			has_login_text: /登录|验证码|手机号/.test(body),
-			has_verification_text: /安全验证|扫码|验证/.test(body),
-			body_text_length: body.length
-		});
-	}`)
-	if err != nil {
-		logrus.Warnf("search_feeds: navigation diagnostics document state unavailable: %v", err)
-		return
-	}
-
-	var state struct {
-		URL                 string `json:"url"`
-		Title               string `json:"title"`
-		ReadyState          string `json:"ready_state"`
-		IsAboutBlank        bool   `json:"is_about_blank"`
-		IsXiaohongshu       bool   `json:"is_xiaohongshu"`
-		HasLoginText        bool   `json:"has_login_text"`
-		HasVerificationText bool   `json:"has_verification_text"`
-		BodyTextLength      int    `json:"body_text_length"`
-	}
-	if err := json.Unmarshal([]byte(result.Value.Str()), &state); err != nil {
-		logrus.Warnf("search_feeds: navigation diagnostics parse failed: %v", err)
-		return
-	}
-	logrus.Warnf("search_feeds: navigation diagnostics ready_state=%s url=%s title=%s about_blank=%t xiaohongshu=%t login_text=%t verification_text=%t body_text_length=%d",
-		state.ReadyState, state.URL, state.Title, state.IsAboutBlank, state.IsXiaohongshu,
-		state.HasLoginText, state.HasVerificationText, state.BodyTextLength)
+	// Page.Context replaces the page context on a clone, so this does not
+	// inherit the expired navigation/action context.
+	diagnosticPage := cloneWithContext(page, diagnosticCtx)
+	return action(diagnosticPage)
 }
 
 func logSearchPageState(page *rod.Page, stage string) {

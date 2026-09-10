@@ -3,7 +3,9 @@ package xiaohongshu
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-rod/rod"
 	"github.com/lisiyuan/xiaohongshu-mcp-pro/browser"
@@ -113,12 +115,85 @@ func TestFilterValidation(t *testing.T) {
 	require.Len(t, internalFilters, 5)
 }
 
+func TestSearchNavigationMustNavigateFailureIsStaged(t *testing.T) {
+	var failedStage string
+	waitCalled := false
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		runSearchNavigationPhases(
+			func() { panic(fmt.Errorf("navigate failed")) },
+			func() { waitCalled = true },
+			func(stage string, _ any) { failedStage = stage },
+		)
+	}()
+	require.Equal(t, "MustNavigate", failedStage)
+	require.False(t, waitCalled, "MustWaitStable must not run after navigation failure")
+	require.Contains(t, fmt.Sprint(recovered), "navigation MustNavigate failed: navigate failed")
+}
+
+func TestSearchNavigationMustWaitStableFailureIsStaged(t *testing.T) {
+	var failedStage string
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		runSearchNavigationPhases(
+			func() {},
+			func() { panic(fmt.Errorf("stable wait failed")) },
+			func(stage string, _ any) { failedStage = stage },
+		)
+	}()
+	require.Equal(t, "MustWaitStable", failedStage)
+	require.Contains(t, fmt.Sprint(recovered), "navigation MustWaitStable failed: stable wait failed")
+}
+
+func TestSearchNavigationSuccessRunsBothPhases(t *testing.T) {
+	steps := make([]string, 0, 2)
+	runSearchNavigationPhases(
+		func() { steps = append(steps, "navigate") },
+		func() { steps = append(steps, "wait-stable") },
+		func(stage string, original any) { t.Fatalf("unexpected %s failure: %v", stage, original) },
+	)
+	require.Equal(t, []string{"navigate", "wait-stable"}, steps)
+}
+
+func TestSearchNavigationDiagnosticsUseIndependentProjects(t *testing.T) {
+	page := &rod.Page{}
+	timeouts := make([]time.Duration, 0, 2)
+	diagnoseSearchNavigationFailureWithRunner(page, "MustNavigate", fmt.Errorf("original"),
+		func(_ *rod.Page, timeout time.Duration, _ func(*rod.Page) error) error {
+			timeouts = append(timeouts, timeout)
+			if len(timeouts) == 1 {
+				return fmt.Errorf("URL/title unavailable")
+			}
+			return fmt.Errorf("document eval unavailable")
+		})
+	require.Equal(t, []time.Duration{800 * time.Millisecond, 1500 * time.Millisecond}, timeouts)
+}
+
+func TestSearchPageDiagnosticDoesNotReuseExpiredContext(t *testing.T) {
+	expiredCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var diagnosticCtx context.Context
+	diagnosticWasActive := false
+	err := runSearchPageDiagnosticWithPageContext(&rod.Page{}, time.Second,
+		func(_ *rod.Page, ctx context.Context) *rod.Page {
+			diagnosticCtx = ctx
+			diagnosticWasActive = ctx.Err() == nil
+			return &rod.Page{}
+		}, func(*rod.Page) error { return nil })
+	require.NoError(t, err)
+	require.NotNil(t, diagnosticCtx)
+	require.True(t, diagnosticWasActive, "diagnostic context must be active while the diagnostic runs")
+	require.NotEqual(t, expiredCtx, diagnosticCtx, "diagnostics must not reuse the expired action context")
+}
+
 func TestSearchNavigationDiagnosticsPreserveOriginalPanic(t *testing.T) {
 	called := false
 	var recovered any
 	func() {
 		defer func() { recovered = recover() }()
-		runSearchNavigation(nil, "https://example.invalid", func(*rod.Page, any) {
+		runSearchNavigation(nil, "https://example.invalid", func(*rod.Page, string, any) {
 			called = true
 			panic("diagnostic failure")
 		})
@@ -129,7 +204,10 @@ func TestSearchNavigationDiagnosticsPreserveOriginalPanic(t *testing.T) {
 	if recovered == nil {
 		t.Fatal("expected the original navigation panic")
 	}
-	if recovered == "diagnostic failure" {
+	if !strings.Contains(fmt.Sprint(recovered), "navigation MustNavigate failed") {
+		t.Fatalf("expected staged navigation panic, got %v", recovered)
+	}
+	if strings.Contains(fmt.Sprint(recovered), "diagnostic failure") {
 		t.Fatal("diagnostic panic replaced the original navigation panic")
 	}
 }
