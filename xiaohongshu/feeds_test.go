@@ -83,3 +83,90 @@ func TestGetFeedsList(t *testing.T) {
 		}
 	}
 }
+
+func TestHomepageSearchProbeCandidateClassification(t *testing.T) {
+	tests := []struct {
+		name     string
+		element  homepageSearchProbeElement
+		priority string
+		ok       bool
+	}{
+		{
+			name: "search placeholder is high priority",
+			element: homepageSearchProbeElement{homepageSearchProbeControl: homepageSearchProbeControl{
+				Placeholder: "搜索笔记",
+			}},
+			priority: "high",
+			ok:       true,
+		},
+		{
+			name: "search aria label is high priority",
+			element: homepageSearchProbeElement{homepageSearchProbeControl: homepageSearchProbeControl{
+				AriaLabel: "搜索",
+			}},
+			priority: "high",
+			ok:       true,
+		},
+		{
+			name: "unrelated top input is secondary",
+			element: homepageSearchProbeElement{
+				homepageSearchProbeControl: homepageSearchProbeControl{
+					Name:    "email",
+					Visible: true,
+					Rect:    homepageSearchProbeRect{Width: 240, Height: 36},
+				},
+				TopArea: true,
+			},
+			priority: "secondary",
+			ok:       true,
+		},
+		{
+			name: "ordinary offscreen input is not a candidate",
+			element: homepageSearchProbeElement{
+				homepageSearchProbeControl: homepageSearchProbeControl{
+					Name:    "email",
+					Visible: true,
+					Rect:    homepageSearchProbeRect{Width: 240, Height: 36},
+				},
+				TopArea: false,
+			},
+			ok: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			priority, ok := homepageSearchProbeCandidate(tt.element)
+			require.Equal(t, tt.ok, ok)
+			require.Equal(t, tt.priority, priority)
+		})
+	}
+}
+
+func TestHomepageSearchProbeCandidateKeepsNearbyButtonStructure(t *testing.T) {
+	element := homepageSearchProbeElement{
+		homepageSearchProbeControl: homepageSearchProbeControl{
+			TagName:     "input",
+			Placeholder: "搜索",
+		},
+		NearbyButtons: []homepageSearchProbeControl{{
+			TagName:   "button",
+			AriaLabel: "搜索",
+			ShortText: "搜索",
+		}},
+	}
+
+	priority, ok := homepageSearchProbeCandidate(element)
+	require.True(t, ok)
+	require.Equal(t, "high", priority)
+	require.Len(t, element.NearbyButtons, 1)
+	require.Contains(t, formatHomepageSearchProbeControl(element.NearbyButtons[0]), `aria_label="搜索"`)
+}
+
+func TestHomepageSearchProbeDoesNotCollectSensitivePageContent(t *testing.T) {
+	require.NotContains(t, homepageSearchProbeScript, ".value", "probe must not read input values")
+	require.NotContains(t, homepageSearchProbeScript, "innerHTML")
+	require.NotContains(t, homepageSearchProbeScript, "outerHTML")
+	require.NotContains(t, homepageSearchProbeScript, "body.innerText")
+	require.NotContains(t, homepageSearchProbeScript, "body.textContent")
+}
