@@ -70,7 +70,10 @@ class HTTPMessage:
 
 
 def post_message(
-    payload: dict[str, Any], session_id: str | None = None, client_name: str = CLIENT_NAME
+    payload: dict[str, Any],
+    session_id: str | None = None,
+    client_name: str = CLIENT_NAME,
+    timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
 ) -> HTTPMessage:
     """POST one MCP JSON-RPC message using Streamable HTTP headers."""
 
@@ -88,7 +91,7 @@ def post_message(
     )
     request = Request(MCP_URL, data=body, headers=headers, method="POST")
     try:
-        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+        with urlopen(request, timeout=timeout_seconds) as response:
             return HTTPMessage(response.status, response.headers, response.read())
     except HTTPError as exc:
         # Do not include the request body or any echoed arguments in an error.
@@ -224,7 +227,9 @@ def call_phone_login(
 
 
 def call_complete_security_verification(
-    session_id: str | None, flow: OTPFlow
+    session_id: str | None,
+    flow: OTPFlow,
+    timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
 ) -> dict[str, Any] | None:
     request = {
         "jsonrpc": "2.0",
@@ -235,7 +240,12 @@ def call_complete_security_verification(
             "arguments": {},
         },
     }
-    response = post_message(request, session_id, client_name=flow.client_name)
+    response = post_message(
+        request,
+        session_id,
+        client_name=flow.client_name,
+        timeout_seconds=timeout_seconds,
+    )
     if response.status != 200:
         raise MCPClientError(f"{flow.complete_security_tool} 请求失败：HTTP {response.status}")
     return response_message(response)
