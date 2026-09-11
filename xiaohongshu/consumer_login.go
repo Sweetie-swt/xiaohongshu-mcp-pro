@@ -323,6 +323,8 @@ func (a *ConsumerLoginAction) VerifyOTP(otp string) (*OTPVerificationResult, err
 		return nil, errors.New("consumer 登录页面不可用")
 	}
 	pp := a.page.Timeout(20 * time.Second)
+	beforeInput := a.collectConsumerVerifyOTPDiagnostics()
+	a.logConsumerVerifyOTPDiagnostics("输入 OTP 前", beforeInput)
 	otpInput, err := pp.ElementByJS(rod.Eval(consumerOTPInputScript))
 	if err != nil {
 		return nil, errors.Wrap(err, "未找到 consumer 验证码输入框")
@@ -337,18 +339,38 @@ func (a *ConsumerLoginAction) VerifyOTP(otp string) (*OTPVerificationResult, err
 	if err := otpInput.Input(otp); err != nil {
 		return nil, errors.Wrap(err, "输入 consumer 验证码失败")
 	}
+	afterInput := a.collectConsumerVerifyOTPDiagnostics()
+	a.logConsumerVerifyOTPDiagnostics("输入 OTP 后、点击登录前", afterInput)
+	if afterInput.OTPInputValueLength != 6 {
+		return nil, fmt.Errorf("consumer 验证码输入失败：页面验证码长度为 %d，期望 6", afterInput.OTPInputValueLength)
+	}
 
 	loginButton, err := pp.ElementByJS(rod.Eval(consumerLoginButtonScript))
 	if err != nil {
 		return nil, errors.Wrap(err, "未找到 consumer 登录按钮")
 	}
 	defer loginButton.Release()
-	if err := loginButton.Click(proto.InputMouseButtonLeft, 1); err != nil {
-		return nil, errors.Wrap(err, "点击 consumer 登录按钮失败")
+	clickErr := loginButton.Click(proto.InputMouseButtonLeft, 1)
+	afterClick := a.collectConsumerVerifyOTPDiagnostics()
+	afterClick.LoginClickDispatched = clickErr == nil
+	afterClick.ButtonStateChanged = consumerVerifyOTPButtonStateChanged(afterInput, afterClick)
+	a.logConsumerVerifyOTPDiagnostics("点击登录后立即", afterClick)
+	if clickErr != nil {
+		return nil, errors.Wrap(clickErr, "点击 consumer 登录按钮失败")
 	}
-	time.Sleep(3 * time.Second)
+
+	time.Sleep(1 * time.Second)
+	afterOneSecond := a.collectConsumerVerifyOTPDiagnostics()
+	afterOneSecond.LoginClickDispatched = true
+	afterOneSecond.ButtonStateChanged = consumerVerifyOTPButtonStateChanged(afterInput, afterOneSecond)
+	a.logConsumerVerifyOTPDiagnostics("点击登录后约 1 秒", afterOneSecond)
+	time.Sleep(2 * time.Second)
 
 	if gate, gateErr := ReadConsumerAuthGate(a.page); gateErr == nil && gate.Present && gate.Kind == "verification" {
+		final := a.collectConsumerVerifyOTPDiagnostics()
+		final.LoginClickDispatched = true
+		final.ButtonStateChanged = consumerVerifyOTPButtonStateChanged(afterInput, final)
+		a.logConsumerVerifyOTPDiagnostics("最终判定前", final)
 		shot, shotErr := a.page.Screenshot(false, nil)
 		if shotErr != nil {
 			logrus.Warnf("consumer 安全验证弹窗截图失败: %v", shotErr)
@@ -360,11 +382,21 @@ func (a *ConsumerLoginAction) VerifyOTP(otp string) (*OTPVerificationResult, err
 	}
 
 	evidence, evidenceErr := WaitForConsumerLoginEvidence(a.page, 5*time.Second)
+	final := a.collectConsumerVerifyOTPDiagnostics()
+	final.LoginClickDispatched = true
+	final.ButtonStateChanged = consumerVerifyOTPButtonStateChanged(afterInput, final)
+	a.logConsumerVerifyOTPDiagnostics("最终判定前", final)
+	if reason := consumerVerifyOTPFailureReason(final.VisibleMessages); reason != "" {
+		return nil, errors.New("consumer 验证码验证失败：" + reason)
+	}
 	if evidenceErr == nil && evidence.Present {
 		return &OTPVerificationResult{Status: OTPVerificationSucceeded}, nil
 	}
-	if gate, gateErr := ReadConsumerAuthGate(a.page); gateErr == nil && gate.Present {
-		return nil, fmt.Errorf("consumer 登录未完成：认证门槛仍可见（%s）", gate.Description())
+	if consumerVerifyOTPShouldBeDiagnosticInconclusive(final) {
+		return nil, errors.New("consumer 登录未完成：diagnostic inconclusive；" + compactConsumerAuthGateDescription(final))
+	}
+	if final.AuthGatePresent {
+		return nil, fmt.Errorf("consumer 登录未完成：认证门槛仍可见（%s）", compactConsumerAuthGateDescription(final))
 	}
 	return nil, errors.New("consumer 登录未完成：未检测到正向登录证据")
 }
