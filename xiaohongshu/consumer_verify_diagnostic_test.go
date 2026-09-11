@@ -110,6 +110,10 @@ func TestConsumerVerifyOTPDiagnosticStagesAreWired(t *testing.T) {
 		require.Contains(t, source, stage)
 	}
 	require.Contains(t, source, "loginButton.Click(proto.InputMouseButtonLeft, 1)")
+	require.Contains(t, source, "networkTrace.Start(context.Background())")
+	require.Contains(t, source, "networkTrace.LogSnapshot(\"点击登录后立即\"")
+	require.Contains(t, source, "networkTrace.LogSnapshot(\"点击登录后约 1 秒\"")
+	require.Contains(t, source, "networkTrace.LogSnapshot(\"最终判定前\"")
 }
 
 func mustReadConsumerVerifySource(t *testing.T) []byte {

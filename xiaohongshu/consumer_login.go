@@ -1,6 +1,7 @@
 package xiaohongshu
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -350,11 +351,22 @@ func (a *ConsumerLoginAction) VerifyOTP(otp string) (*OTPVerificationResult, err
 		return nil, errors.Wrap(err, "未找到 consumer 登录按钮")
 	}
 	defer loginButton.Release()
+	beforeModalText := a.readConsumerVerifyDOMTextSnapshot()
+	beforeSecurityNodes := a.readConsumerVerifySecurityNodes()
+	networkTrace := newConsumerVerifyNetworkTrace(a.page)
+	if err := networkTrace.Start(context.Background()); err != nil {
+		logrus.Warnf("consumer VerifyOTP 网络诊断监听启动受限: %v", err)
+	}
+	defer networkTrace.Stop()
+	networkTrace.Arm()
 	clickErr := loginButton.Click(proto.InputMouseButtonLeft, 1)
 	afterClick := a.collectConsumerVerifyOTPDiagnostics()
 	afterClick.LoginClickDispatched = clickErr == nil
 	afterClick.ButtonStateChanged = consumerVerifyOTPButtonStateChanged(afterInput, afterClick)
 	a.logConsumerVerifyOTPDiagnostics("点击登录后立即", afterClick)
+	a.logConsumerVerifyDOMTextDiff("点击登录后立即", beforeModalText, a.readConsumerVerifyDOMTextSnapshot())
+	a.logConsumerVerifySecurityNodes("点击登录后立即", beforeSecurityNodes, a.readConsumerVerifySecurityNodes())
+	networkTrace.LogSnapshot("点击登录后立即", afterClick.AuthGatePresent, afterClick.AuthGateKind)
 	if clickErr != nil {
 		return nil, errors.Wrap(clickErr, "点击 consumer 登录按钮失败")
 	}
@@ -364,6 +376,9 @@ func (a *ConsumerLoginAction) VerifyOTP(otp string) (*OTPVerificationResult, err
 	afterOneSecond.LoginClickDispatched = true
 	afterOneSecond.ButtonStateChanged = consumerVerifyOTPButtonStateChanged(afterInput, afterOneSecond)
 	a.logConsumerVerifyOTPDiagnostics("点击登录后约 1 秒", afterOneSecond)
+	a.logConsumerVerifyDOMTextDiff("点击登录后约 1 秒", beforeModalText, a.readConsumerVerifyDOMTextSnapshot())
+	a.logConsumerVerifySecurityNodes("点击登录后约 1 秒", beforeSecurityNodes, a.readConsumerVerifySecurityNodes())
+	networkTrace.LogSnapshot("点击登录后约 1 秒", afterOneSecond.AuthGatePresent, afterOneSecond.AuthGateKind)
 	time.Sleep(2 * time.Second)
 
 	if gate, gateErr := ReadConsumerAuthGate(a.page); gateErr == nil && gate.Present && gate.Kind == "verification" {
@@ -371,6 +386,9 @@ func (a *ConsumerLoginAction) VerifyOTP(otp string) (*OTPVerificationResult, err
 		final.LoginClickDispatched = true
 		final.ButtonStateChanged = consumerVerifyOTPButtonStateChanged(afterInput, final)
 		a.logConsumerVerifyOTPDiagnostics("最终判定前", final)
+		a.logConsumerVerifyDOMTextDiff("最终判定前", beforeModalText, a.readConsumerVerifyDOMTextSnapshot())
+		a.logConsumerVerifySecurityNodes("最终判定前", beforeSecurityNodes, a.readConsumerVerifySecurityNodes())
+		networkTrace.LogSnapshot("最终判定前", final.AuthGatePresent, final.AuthGateKind)
 		shot, shotErr := a.page.Screenshot(false, nil)
 		if shotErr != nil {
 			logrus.Warnf("consumer 安全验证弹窗截图失败: %v", shotErr)
@@ -386,14 +404,25 @@ func (a *ConsumerLoginAction) VerifyOTP(otp string) (*OTPVerificationResult, err
 	final.LoginClickDispatched = true
 	final.ButtonStateChanged = consumerVerifyOTPButtonStateChanged(afterInput, final)
 	a.logConsumerVerifyOTPDiagnostics("最终判定前", final)
+	a.logConsumerVerifyDOMTextDiff("最终判定前", beforeModalText, a.readConsumerVerifyDOMTextSnapshot())
+	a.logConsumerVerifySecurityNodes("最终判定前", beforeSecurityNodes, a.readConsumerVerifySecurityNodes())
+	networkOutcome := networkTrace.LogSnapshot("最终判定前", final.AuthGatePresent, final.AuthGateKind)
 	if reason := consumerVerifyOTPFailureReason(final.VisibleMessages); reason != "" {
 		return nil, errors.New("consumer 验证码验证失败：" + reason)
 	}
 	if evidenceErr == nil && evidence.Present {
 		return &OTPVerificationResult{Status: OTPVerificationSucceeded}, nil
 	}
+	if networkOutcome == consumerVerifyOutcomeTransportFailed ||
+		networkOutcome == consumerVerifyOutcomeRejected ||
+		networkOutcome == consumerVerifyOutcomeSuccessGateRemains {
+		return nil, fmt.Errorf("consumer 登录未完成：%s；%s", networkOutcome, compactConsumerAuthGateDescription(final))
+	}
 	if consumerVerifyOTPShouldBeDiagnosticInconclusive(final) {
-		return nil, errors.New("consumer 登录未完成：diagnostic inconclusive；" + compactConsumerAuthGateDescription(final))
+		return nil, fmt.Errorf("consumer 登录未完成：%s；%s", networkOutcome, compactConsumerAuthGateDescription(final))
+	}
+	if networkOutcome == consumerVerifyOutcomeRequestNotObserved || networkOutcome == consumerVerifyOutcomeDiagnosticInconclusive {
+		return nil, fmt.Errorf("consumer 登录未完成：%s；%s", networkOutcome, compactConsumerAuthGateDescription(final))
 	}
 	if final.AuthGatePresent {
 		return nil, fmt.Errorf("consumer 登录未完成：认证门槛仍可见（%s）", compactConsumerAuthGateDescription(final))
