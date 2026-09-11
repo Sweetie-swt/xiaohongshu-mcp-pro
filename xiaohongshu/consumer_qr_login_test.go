@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDecodePNGDataURL(t *testing.T) {
@@ -86,9 +87,59 @@ func TestConsumerQRCodeDOMSnapshotScriptUsesOnlyExistingDOM(t *testing.T) {
 			t.Fatalf("DOM probe script is missing selector %q", selector)
 		}
 	}
-	for _, forbidden := range []string{"fetch(", "XMLHttpRequest", "/api/"} {
+	for _, forbidden := range []string{"fetch(", "XMLHttpRequest", "/api/", "cookie", "token", "session"} {
 		if strings.Contains(consumerQRCodeDOMSnapshotScript, forbidden) {
 			t.Fatalf("DOM probe script contains forbidden network operation %q", forbidden)
+		}
+	}
+}
+
+func TestConsumerQRCodeDiagnosticStateAndHeartbeatSchedule(t *testing.T) {
+	if got, want := len(consumerQRCodeDiagnosticHeartbeatOffsets), 8; got != want {
+		t.Fatalf("heartbeat count = %d, want %d", got, want)
+	}
+	wantOffsets := []time.Duration{
+		0,
+		2 * time.Second,
+		5 * time.Second,
+		10 * time.Second,
+		30 * time.Second,
+		60 * time.Second,
+		120 * time.Second,
+		180 * time.Second,
+	}
+	for i, want := range wantOffsets {
+		if got := consumerQRCodeDiagnosticHeartbeatOffsets[i]; got != want {
+			t.Fatalf("heartbeat offset[%d] = %s, want %s", i, got, want)
+		}
+	}
+
+	if got := consumerQRCodeDiagnosticState(consumerQRCodeDOMSnapshot{
+		ModalVisible: true, QRCodeVisible: true, StatusText: "未知页面状态",
+	}, true); got != "unknown_status" {
+		t.Fatalf("unknown status diagnostic state = %q, want unknown_status", got)
+	}
+	if got := consumerQRCodeDiagnosticState(consumerQRCodeDOMSnapshot{}, true); got != string(ConsumerQRCodeModalMissing) {
+		t.Fatalf("modal-missing diagnostic state = %q, want %q", got, ConsumerQRCodeModalMissing)
+	}
+}
+
+func TestSanitizeConsumerQRCodeURLRemovesSensitiveURLParts(t *testing.T) {
+	got := sanitizeConsumerQRCodeURL("https://www.xiaohongshu.com/login?token=secret#session")
+	if want := "https://www.xiaohongshu.com/login"; got != want {
+		t.Fatalf("sanitized URL = %q, want %q", got, want)
+	}
+}
+
+func TestConsumerQRCodeCaptchaSnapshotScriptIsReadOnlyAndRedCaptchaAware(t *testing.T) {
+	for _, selector := range []string{"redcaptcha", "red-captcha", "captcha"} {
+		if !strings.Contains(consumerQRCodeCaptchaSnapshotScript, selector) {
+			t.Fatalf("captcha probe script is missing selector marker %q", selector)
+		}
+	}
+	for _, forbidden := range []string{"fetch(", "XMLHttpRequest", "/api/", "document.cookie"} {
+		if strings.Contains(consumerQRCodeCaptchaSnapshotScript, forbidden) {
+			t.Fatalf("captcha probe script contains forbidden operation %q", forbidden)
 		}
 	}
 }

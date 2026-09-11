@@ -5,11 +5,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -34,6 +36,206 @@ type consumerQRCodeDOMSnapshot struct {
 	QRCodeVisible bool   `json:"qr_code_visible"`
 	StatusText    string `json:"status_text"`
 	ImageSrc      string `json:"image_src"`
+}
+
+type consumerQRCodeCaptchaSnapshot struct {
+	Visible bool   `json:"visible"`
+	Selector string `json:"selector"`
+}
+
+type consumerQRCodeDiagnosticSnapshot struct {
+	DOM                   consumerQRCodeDOMSnapshot
+	URL                   string
+	Title                 string
+	QRState               string
+	GateProbeOK           bool
+	GatePresent           bool
+	GateKind              string
+	GateSelector          string
+	RedCaptchaProbeOK     bool
+	RedCaptchaPresent     bool
+	RedCaptchaSelector    string
+}
+
+type consumerQRCodeDiagnosticKey struct {
+	ModalVisible       bool
+	QRCodeVisible      bool
+	StatusText         string
+	URL                string
+	Title              string
+	QRState            string
+	GateProbeOK        bool
+	GatePresent        bool
+	GateKind           string
+	GateSelector       string
+	RedCaptchaProbeOK  bool
+	RedCaptchaPresent  bool
+	RedCaptchaSelector string
+}
+
+var consumerQRCodeDiagnosticHeartbeatOffsets = []time.Duration{
+	0,
+	2 * time.Second,
+	5 * time.Second,
+	10 * time.Second,
+	30 * time.Second,
+	60 * time.Second,
+	120 * time.Second,
+	180 * time.Second,
+}
+
+type consumerQRCodeDiagnostics struct {
+	start          time.Time
+	nextHeartbeat  int
+	hasLast        bool
+	lastKey        consumerQRCodeDiagnosticKey
+	lastSnapshot   consumerQRCodeDiagnosticSnapshot
+}
+
+func newConsumerQRCodeDiagnostics() *consumerQRCodeDiagnostics {
+	return &consumerQRCodeDiagnostics{start: time.Now()}
+}
+
+func (d *consumerQRCodeDiagnostics) observe(page *rod.Page, dom consumerQRCodeDOMSnapshot, seenQRCode bool) {
+	if d == nil {
+		return
+	}
+	elapsed := time.Since(d.start)
+	snapshot := readConsumerQRCodeDiagnosticSnapshot(page, dom, seenQRCode)
+	key := snapshot.key()
+	stateChanged := !d.hasLast || key != d.lastKey
+	heartbeatDue := false
+	for d.nextHeartbeat < len(consumerQRCodeDiagnosticHeartbeatOffsets) &&
+		elapsed >= consumerQRCodeDiagnosticHeartbeatOffsets[d.nextHeartbeat] {
+		d.nextHeartbeat++
+		heartbeatDue = true
+	}
+	d.lastSnapshot = snapshot
+	if stateChanged || heartbeatDue {
+		phase := "state_change"
+		if heartbeatDue {
+			phase = "heartbeat"
+			if stateChanged {
+				phase = "state_change+heartbeat"
+			}
+		}
+		d.log(phase, elapsed, snapshot, true)
+	}
+	d.lastKey = key
+	d.hasLast = true
+}
+
+func (d *consumerQRCodeDiagnostics) logFinal(page *rod.Page, seenQRCode bool) {
+	if d == nil {
+		return
+	}
+	dom, err := readConsumerQRCodeDOMSnapshot(page)
+	if err != nil {
+		if d.hasLast {
+			d.log("final_snapshot_dom_unavailable", time.Since(d.start), d.lastSnapshot, false)
+			return
+		}
+		logrus.WithFields(logrus.Fields{
+			"phase":       "final_snapshot_dom_unavailable",
+			"elapsed_ms":  time.Since(d.start).Milliseconds(),
+			"dom_probe_ok": false,
+		}).Info("consumer QR diagnostic")
+		return
+	}
+	d.log("final_snapshot", time.Since(d.start), readConsumerQRCodeDiagnosticSnapshot(page, dom, seenQRCode), true)
+}
+
+func (d *consumerQRCodeDiagnostics) log(phase string, elapsed time.Duration, snapshot consumerQRCodeDiagnosticSnapshot, domProbeOK bool) {
+	logrus.WithFields(logrus.Fields{
+		"phase":                 phase,
+		"elapsed_ms":            elapsed.Milliseconds(),
+		"dom_probe_ok":          domProbeOK,
+		"modal_visible":         snapshot.DOM.ModalVisible,
+		"qr_code_visible":       snapshot.DOM.QRCodeVisible,
+		"qr_state":              snapshot.QRState,
+		"status_text":           snapshot.DOM.StatusText,
+		"url":                   snapshot.URL,
+		"title":                 snapshot.Title,
+		"auth_gate_probe_ok":    snapshot.GateProbeOK,
+		"auth_gate_present":     snapshot.GatePresent,
+		"auth_gate_kind":        snapshot.GateKind,
+		"auth_gate_selector":    snapshot.GateSelector,
+		"redcaptcha_probe_ok":   snapshot.RedCaptchaProbeOK,
+		"redcaptcha_present":    snapshot.RedCaptchaPresent,
+		"redcaptcha_selector":   snapshot.RedCaptchaSelector,
+	}).Info("consumer QR diagnostic")
+}
+
+func (s consumerQRCodeDiagnosticSnapshot) key() consumerQRCodeDiagnosticKey {
+	return consumerQRCodeDiagnosticKey{
+		ModalVisible:       s.DOM.ModalVisible,
+		QRCodeVisible:      s.DOM.QRCodeVisible,
+		StatusText:         s.DOM.StatusText,
+		URL:                s.URL,
+		Title:              s.Title,
+		QRState:            s.QRState,
+		GateProbeOK:        s.GateProbeOK,
+		GatePresent:        s.GatePresent,
+		GateKind:           s.GateKind,
+		GateSelector:       s.GateSelector,
+		RedCaptchaProbeOK:  s.RedCaptchaProbeOK,
+		RedCaptchaPresent:  s.RedCaptchaPresent,
+		RedCaptchaSelector: s.RedCaptchaSelector,
+	}
+}
+
+func readConsumerQRCodeDiagnosticSnapshot(page *rod.Page, dom consumerQRCodeDOMSnapshot, seenQRCode bool) consumerQRCodeDiagnosticSnapshot {
+	snapshot := consumerQRCodeDiagnosticSnapshot{
+		DOM:     dom,
+		QRState: consumerQRCodeDiagnosticState(dom, seenQRCode),
+	}
+	if info, err := page.Info(); err == nil && info != nil {
+		snapshot.URL = sanitizeConsumerQRCodeURL(info.URL)
+		snapshot.Title = sanitizeConsumerQRCodeText(info.Title)
+	}
+	if gate, err := ReadConsumerAuthGate(page); err == nil && gate != nil {
+		snapshot.GateProbeOK = true
+		snapshot.GatePresent = gate.Present
+		if gate.Present {
+			snapshot.GateKind = sanitizeConsumerQRCodeText(gate.Kind)
+			snapshot.GateSelector = sanitizeConsumerQRCodeText(gate.Selector)
+		}
+	}
+	if captcha, err := readConsumerQRCodeCaptchaSnapshot(page); err == nil {
+		snapshot.RedCaptchaProbeOK = true
+		snapshot.RedCaptchaPresent = captcha.Visible
+		snapshot.RedCaptchaSelector = sanitizeConsumerQRCodeText(captcha.Selector)
+	}
+	return snapshot
+}
+
+func consumerQRCodeDiagnosticState(snapshot consumerQRCodeDOMSnapshot, seenQRCode bool) string {
+	if state := consumerQRCodeState(snapshot, seenQRCode); state != "" {
+		return string(state)
+	}
+	if snapshot.StatusText != "" {
+		return "unknown_status"
+	}
+	return "unknown"
+}
+
+func sanitizeConsumerQRCodeURL(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "[unavailable]"
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+func sanitizeConsumerQRCodeText(value string) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if len(value) > 160 {
+		return value[:160]
+	}
+	return value
 }
 
 // NavigateToQRCodeLogin opens the consumer login page and waits for the
@@ -112,6 +314,8 @@ func (a *ConsumerLoginAction) WaitForConsumerQRCodeLogin(ctx context.Context, ti
 	}
 	deadline := time.Now().Add(timeout)
 	seenQRCode := false
+	diagnostics := newConsumerQRCodeDiagnostics()
+	defer func() { diagnostics.logFinal(a.page, seenQRCode) }()
 	for {
 		snapshot, err := readConsumerQRCodeDOMSnapshot(a.page.Context(ctx))
 		if err != nil {
@@ -120,6 +324,7 @@ func (a *ConsumerLoginAction) WaitForConsumerQRCodeLogin(ctx context.Context, ti
 		if snapshot.QRCodeVisible {
 			seenQRCode = true
 		}
+		diagnostics.observe(a.page, snapshot, seenQRCode)
 		switch consumerQRCodeState(snapshot, seenQRCode) {
 		case ConsumerQRCodeLoginExpired:
 			return ConsumerQRCodeLoginExpired, nil
@@ -171,6 +376,21 @@ func readConsumerQRCodeDOMSnapshot(page *rod.Page) (consumerQRCodeDOMSnapshot, e
 	return snapshot, nil
 }
 
+func readConsumerQRCodeCaptchaSnapshot(page *rod.Page) (consumerQRCodeCaptchaSnapshot, error) {
+	if page == nil {
+		return consumerQRCodeCaptchaSnapshot{}, errors.New("consumer QR page is nil")
+	}
+	result, err := page.Eval(consumerQRCodeCaptchaSnapshotScript)
+	if err != nil {
+		return consumerQRCodeCaptchaSnapshot{}, err
+	}
+	var snapshot consumerQRCodeCaptchaSnapshot
+	if err := json.Unmarshal([]byte(result.Value.String()), &snapshot); err != nil {
+		return consumerQRCodeCaptchaSnapshot{}, err
+	}
+	return snapshot, nil
+}
+
 func decodePNGDataURL(value string) ([]byte, error) {
 	const prefix = "data:image/png;base64,"
 	if !strings.HasPrefix(value, prefix) {
@@ -210,4 +430,25 @@ const consumerQRCodeDOMSnapshotScript = `() => {
     status_text: visible(status) ? String(status.innerText || status.textContent || '').replace(/\s+/g, ' ').trim() : '',
     image_src: qr ? String(qr.src || '') : ''
   });
+}`
+
+const consumerQRCodeCaptchaSnapshotScript = `() => {
+  const visible = (node) => {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0 &&
+      node.getAttribute('aria-hidden') !== 'true';
+  };
+  const selectors = [
+    '[id*="redcaptcha" i]', '[class*="redcaptcha" i]',
+    '[id*="red-captcha" i]', '[class*="red-captcha" i]',
+    '[id*="captcha" i]', '[class*="captcha" i]'
+  ];
+  for (const selector of selectors) {
+    const node = Array.from(document.querySelectorAll(selector)).find(visible);
+    if (node) return JSON.stringify({visible: true, selector});
+  }
+  return JSON.stringify({visible: false, selector: ''});
 }`
