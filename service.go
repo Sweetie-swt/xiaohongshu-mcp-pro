@@ -669,8 +669,9 @@ func (s *XiaohongshuService) CreatorPhoneLogin(phone string) (*CreatorPhoneLogin
 
 // ConsumerPhoneLoginResponse consumer www 手机号登录响应。
 type ConsumerPhoneLoginResponse struct {
-	Screenshot string `json:"screenshot"`
-	Message    string `json:"message"`
+	Screenshot string                    `json:"screenshot"`
+	Message    string                    `json:"message"`
+	Status     xiaohongshu.OTPSendStatus `json:"status"`
 }
 
 // ConsumerPhoneLogin 在 www 消费端登录弹窗中发送短信验证码。
@@ -709,6 +710,7 @@ func (s *XiaohongshuService) ConsumerPhoneLogin(phone string) (*ConsumerPhoneLog
 		return &ConsumerPhoneLoginResponse{
 			Screenshot: fmt.Sprintf("data:image/png;base64,%s", encodeBase64(otpResult.Screenshot)),
 			Message:    otpResult.Message,
+			Status:     otpResult.Status,
 		}, err
 	}
 
@@ -717,6 +719,7 @@ func (s *XiaohongshuService) ConsumerPhoneLogin(phone string) (*ConsumerPhoneLog
 	return &ConsumerPhoneLoginResponse{
 		Screenshot: fmt.Sprintf("data:image/png;base64,%s", encodeBase64(otpResult.Screenshot)),
 		Message:    otpResult.Message,
+		Status:     otpResult.Status,
 	}, nil
 }
 

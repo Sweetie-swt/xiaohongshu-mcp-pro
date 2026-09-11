@@ -1011,14 +1011,14 @@ func (s *AppServer) handleConsumerPhoneLogin(ctx context.Context, phone string) 
 			if idx := strings.Index(imgData, ","); idx >= 0 {
 				imgData = imgData[idx+1:]
 			}
-			content := []MCPContent{{Type: "text", Text: resp.Message}}
+			content := []MCPContent{{Type: "text", Text: formatConsumerPhoneLoginStatus(resp)}}
 			if imgData != "" {
 				content = append(content, MCPContent{Type: "image", Data: imgData, MimeType: "image/png"})
 			}
 			return &MCPToolResult{Content: content, IsError: true}
 		}
 		return &MCPToolResult{
-			Content: []MCPContent{{Type: "text", Text: "consumer 发送验证码失败: " + err.Error()}},
+			Content: []MCPContent{{Type: "text", Text: "status=failed\nconsumer 发送验证码失败: " + err.Error()}},
 			IsError: true,
 		}
 	}
@@ -1029,10 +1029,21 @@ func (s *AppServer) handleConsumerPhoneLogin(ctx context.Context, phone string) 
 	}
 	return &MCPToolResult{
 		Content: []MCPContent{
-			{Type: "text", Text: resp.Message},
+			{Type: "text", Text: formatConsumerPhoneLoginStatus(resp)},
 			{Type: "image", Data: imgData, MimeType: "image/png"},
 		},
 	}
+}
+
+func formatConsumerPhoneLoginStatus(resp *ConsumerPhoneLoginResponse) string {
+	if resp == nil {
+		return "status=failed\nconsumer 发送验证码失败：未返回有效状态"
+	}
+	status := string(resp.Status)
+	if status == "" {
+		status = string(xiaohongshu.OTPSendFailed)
+	}
+	return fmt.Sprintf("status=%s\n%s", status, resp.Message)
 }
 
 // handleConsumerVerifyOTP 填写 www 消费端验证码。

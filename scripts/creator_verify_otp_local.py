@@ -35,6 +35,7 @@ class OTPFlow:
     complete_security_tool: str
     success_marker: str
     security_image_prefix: str
+    phone_tool: str | None = None
 
 
 CREATOR_FLOW = OTPFlow(
@@ -53,6 +54,7 @@ CONSUMER_FLOW = OTPFlow(
     complete_security_tool="consumer_complete_security_verification",
     success_marker="consumer 登录成功",
     security_image_prefix="bunny-consumer-security-",
+    phone_tool="consumer_phone_login",
 )
 
 
@@ -201,6 +203,26 @@ def call_creator_verify_otp(otp: str, session_id: str | None) -> dict[str, Any] 
     return call_verify_otp(otp, session_id, CREATOR_FLOW)
 
 
+def call_phone_login(
+    phone: str, session_id: str | None, flow: OTPFlow
+) -> dict[str, Any] | None:
+    if not flow.phone_tool:
+        raise MCPClientError(f"{flow.key} flow 没有手机号登录工具")
+    request = {
+        "jsonrpc": "2.0",
+        "id": f"bunny-local-{flow.key}-phone-login",
+        "method": "tools/call",
+        "params": {
+            "name": flow.phone_tool,
+            "arguments": {"phone": phone},
+        },
+    }
+    response = post_message(request, session_id, client_name=flow.client_name)
+    if response.status != 200:
+        raise MCPClientError(f"{flow.phone_tool} 请求失败：HTTP {response.status}")
+    return response_message(response)
+
+
 def call_complete_security_verification(
     session_id: str | None, flow: OTPFlow
 ) -> dict[str, Any] | None:
@@ -285,14 +307,21 @@ def tool_result_parts(
     return bool(result.get("isError")), texts, images
 
 
-def print_tool_result(message: dict[str, Any] | None, secret: str) -> None:
+def print_tool_result(
+    message: dict[str, Any] | None,
+    secret: str,
+    redact_values: tuple[str, ...] = (),
+) -> None:
     is_error, texts, images = tool_result_parts(message)
     if not message:
         print("远端 MCP 没有返回可显示的结果。")
         return
     if texts:
         prefix = "MCP 调用失败：" if is_error else ""
-        print(prefix + redact("\n".join(texts), secret))
+        output = "\n".join(texts)
+        for value in (secret, *redact_values):
+            output = redact(output, value)
+        print(prefix + output)
     elif images:
         print("远端 MCP 返回了图片，但没有可显示的文字结果。")
     else:

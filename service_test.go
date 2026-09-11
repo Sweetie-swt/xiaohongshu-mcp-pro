@@ -358,6 +358,24 @@ func TestWithProfileBrowserPageCleansUpAfterSuccessErrorTimeoutCancelAndPanic(t 
 	}
 }
 
+func TestFormatConsumerPhoneLoginStatus(t *testing.T) {
+	for _, status := range []xiaohongshu.OTPSendStatus{
+		xiaohongshu.OTPSendConfirmed,
+		xiaohongshu.OTPSendUncertain,
+		xiaohongshu.OTPSendFailed,
+	} {
+		t.Run(string(status), func(t *testing.T) {
+			got := formatConsumerPhoneLoginStatus(&ConsumerPhoneLoginResponse{
+				Status:  status,
+				Message: "message",
+			})
+			if !strings.Contains(got, "status="+string(status)) {
+				t.Fatalf("status missing from response: %q", got)
+			}
+		})
+	}
+}
+
 func TestHandleSearchFeedsLaunchFailureReturnsToolError(t *testing.T) {
 	originalFactory := profileBrowserPageFactory
 	t.Cleanup(func() { profileBrowserPageFactory = originalFactory })

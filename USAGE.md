@@ -122,20 +122,18 @@ get_login_qrcode()
 ### 消费端手机号登录（用于 search_feeds）
 
 当 `check_login_status` 报告 `consumer session not established`，说明 Creator
-会话存在但 www 消费端尚未完成登录。此时使用独立的消费端登录链：
+会话存在但 www 消费端尚未完成登录。此时在 Bunny 本地终端使用完整的消费端登录链：
 
 ```
-consumer_phone_login(phone="13800000000")
-→ www 登录弹窗发送验证码并返回截图
-
-# 在本地 Bunny terminal 运行 helper，交互式输入验证码；不要把 OTP 放入命令行或聊天
-python scripts/consumer_verify_otp_local.py
-→ 通过 www 正向登录证据后保存 consumer session
+# 手机号和 OTP 都只在本地隐藏输入，不放入命令行或聊天
+python scripts/consumer_login_local.py
+→ 本地调用 consumer_phone_login，等待输入 OTP，再调用 consumer_verify_otp
 ```
 
 如果返回 `security_verification_required`，用小红书 App 完成截图中的安全验证，
-然后调用 `consumer_complete_security_verification`。完成后再次调用
-`check_login_status`，确认后再调用 `search_feeds`。
+然后回到 Bunny 终端按 Enter；helper 会调用 `consumer_complete_security_verification`。
+旧的 `consumer_verify_otp_local.py` 入口仍保留，仅用于已有验证码发送会话的兼容场景。
+完成后调用 `check_login_status`，确认后再调用 `search_feeds`。
 
 ---
 
