@@ -1,6 +1,7 @@
 package xiaohongshu
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -55,4 +56,17 @@ func TestConsumerAuthGateScriptCoversKnownAndGenericModalStructures(t *testing.T
 	} {
 		require.Contains(t, consumerAuthGateScript, fragment)
 	}
+	kindStart := strings.Index(consumerAuthGateScript, "const kind =")
+	require.GreaterOrEqual(t, kindStart, 0)
+	kindEnd := strings.Index(consumerAuthGateScript[kindStart:], "? 'verification'")
+	require.GreaterOrEqual(t, kindEnd, 0)
+	kindRule := consumerAuthGateScript[kindStart : kindStart+kindEnd]
+	require.Contains(t, kindRule, "安全验证")
+	require.NotContains(t, kindRule, "验证码")
+}
+
+func TestConsumerLoginEvidenceUsesPositiveUserChannelSelectors(t *testing.T) {
+	require.Contains(t, consumerLoginEvidenceScript, "div.main-container li.user.side-bar-component a.link-wrapper span.channel")
+	require.Contains(t, consumerLoginEvidenceScript, ".main-container .user .link-wrapper .channel")
+	require.Contains(t, consumerLoginEvidenceScript, "visible-user-channel")
 }

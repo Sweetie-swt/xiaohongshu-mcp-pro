@@ -27,6 +27,35 @@ CLIENT_VERSION = "0.1.0"
 REQUEST_TIMEOUT_SECONDS = 30
 
 
+@dataclass(frozen=True)
+class OTPFlow:
+    key: str
+    client_name: str
+    verify_tool: str
+    complete_security_tool: str
+    success_marker: str
+    security_image_prefix: str
+
+
+CREATOR_FLOW = OTPFlow(
+    key="creator",
+    client_name="bunny-local-creator-otp",
+    verify_tool="creator_verify_otp",
+    complete_security_tool="creator_complete_security_verification",
+    success_marker="creator 登录成功",
+    security_image_prefix="bunny-creator-security-",
+)
+
+CONSUMER_FLOW = OTPFlow(
+    key="consumer",
+    client_name="bunny-local-consumer-otp",
+    verify_tool="consumer_verify_otp",
+    complete_security_tool="consumer_complete_security_verification",
+    success_marker="consumer 登录成功",
+    security_image_prefix="bunny-consumer-security-",
+)
+
+
 class MCPClientError(RuntimeError):
     """An MCP transport or protocol error that is safe to show to the user."""
 
@@ -39,7 +68,7 @@ class HTTPMessage:
 
 
 def post_message(
-    payload: dict[str, Any], session_id: str | None = None
+    payload: dict[str, Any], session_id: str | None = None, client_name: str = CLIENT_NAME
 ) -> HTTPMessage:
     """POST one MCP JSON-RPC message using Streamable HTTP headers."""
 
@@ -47,7 +76,7 @@ def post_message(
         "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json",
         "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
-        "User-Agent": f"{CLIENT_NAME}/{CLIENT_VERSION}",
+        "User-Agent": f"{client_name}/{CLIENT_VERSION}",
     }
     if session_id:
         headers["Mcp-Session-Id"] = session_id
@@ -108,7 +137,7 @@ def response_message(response: HTTPMessage) -> dict[str, Any] | None:
     return messages[0] if messages else None
 
 
-def initialize() -> str | None:
+def initialize(flow: OTPFlow = CREATOR_FLOW) -> str | None:
     """Perform initialize and notifications/initialized, returning session ID."""
 
     initialize_request = {
@@ -118,10 +147,10 @@ def initialize() -> str | None:
         "params": {
             "protocolVersion": MCP_PROTOCOL_VERSION,
             "capabilities": {},
-            "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},
+            "clientInfo": {"name": flow.client_name, "version": CLIENT_VERSION},
         },
     }
-    response = post_message(initialize_request)
+    response = post_message(initialize_request, client_name=flow.client_name)
     if response.status != 200:
         raise MCPClientError(f"MCP initialize 失败：HTTP {response.status}")
     message = response_message(response)
@@ -140,7 +169,9 @@ def initialize() -> str | None:
         "method": "notifications/initialized",
         "params": {},
     }
-    initialized_response = post_message(initialized_request, session_id)
+    initialized_response = post_message(
+        initialized_request, session_id, client_name=flow.client_name
+    )
     if initialized_response.status not in (200, 202, 204):
         raise MCPClientError(
             f"MCP notifications/initialized 失败：HTTP {initialized_response.status}"
@@ -148,44 +179,53 @@ def initialize() -> str | None:
     return session_id
 
 
-def call_creator_verify_otp(otp: str, session_id: str | None) -> dict[str, Any] | None:
+def call_verify_otp(
+    otp: str, session_id: str | None, flow: OTPFlow
+) -> dict[str, Any] | None:
     request = {
         "jsonrpc": "2.0",
-        "id": "bunny-local-verify-otp",
+        "id": f"bunny-local-{flow.key}-verify-otp",
         "method": "tools/call",
         "params": {
-            "name": "creator_verify_otp",
+            "name": flow.verify_tool,
             "arguments": {"otp": otp},
         },
     }
-    response = post_message(request, session_id)
+    response = post_message(request, session_id, client_name=flow.client_name)
     if response.status != 200:
-        raise MCPClientError(f"creator_verify_otp 请求失败：HTTP {response.status}")
+        raise MCPClientError(f"{flow.verify_tool} 请求失败：HTTP {response.status}")
+    return response_message(response)
+
+
+def call_creator_verify_otp(otp: str, session_id: str | None) -> dict[str, Any] | None:
+    return call_verify_otp(otp, session_id, CREATOR_FLOW)
+
+
+def call_complete_security_verification(
+    session_id: str | None, flow: OTPFlow
+) -> dict[str, Any] | None:
+    request = {
+        "jsonrpc": "2.0",
+        "id": f"bunny-local-{flow.key}-complete-security-verification",
+        "method": "tools/call",
+        "params": {
+            "name": flow.complete_security_tool,
+            "arguments": {},
+        },
+    }
+    response = post_message(request, session_id, client_name=flow.client_name)
+    if response.status != 200:
+        raise MCPClientError(f"{flow.complete_security_tool} 请求失败：HTTP {response.status}")
     return response_message(response)
 
 
 def call_creator_complete_security_verification(
     session_id: str | None,
 ) -> dict[str, Any] | None:
-    request = {
-        "jsonrpc": "2.0",
-        "id": "bunny-local-complete-security-verification",
-        "method": "tools/call",
-        "params": {
-            "name": "creator_complete_security_verification",
-            "arguments": {},
-        },
-    }
-    response = post_message(request, session_id)
-    if response.status != 200:
-        raise MCPClientError(
-            "creator_complete_security_verification 请求失败："
-            f"HTTP {response.status}"
-        )
-    return response_message(response)
+    return call_complete_security_verification(session_id, CREATOR_FLOW)
 
 
-def close_session(session_id: str | None) -> None:
+def close_session(session_id: str | None, client_name: str = CLIENT_NAME) -> None:
     """Best-effort Streamable HTTP session cleanup; never logs request data."""
 
     if not session_id:
@@ -196,7 +236,7 @@ def close_session(session_id: str | None) -> None:
             "Accept": "application/json, text/event-stream",
             "Mcp-Protocol-Version": MCP_PROTOCOL_VERSION,
             "Mcp-Session-Id": session_id,
-            "User-Agent": f"{CLIENT_NAME}/{CLIENT_VERSION}",
+            "User-Agent": f"{client_name}/{CLIENT_VERSION}",
         },
         method="DELETE",
     )
@@ -270,15 +310,21 @@ def is_security_verification_required(message: dict[str, Any] | None) -> bool:
     )
 
 
-def is_direct_success(message: dict[str, Any] | None) -> bool:
+def is_direct_success_for_flow(
+    message: dict[str, Any] | None, flow: OTPFlow
+) -> bool:
     is_error, texts, _ = tool_result_parts(message)
     if is_error or is_security_verification_required(message):
         return False
-    return any("creator 登录成功" in text for text in texts)
+    return any(flow.success_marker in text for text in texts)
+
+
+def is_direct_success(message: dict[str, Any] | None) -> bool:
+    return is_direct_success_for_flow(message, CREATOR_FLOW)
 
 
 def write_and_open_security_image(
-    images: list[tuple[str, str]],
+    images: list[tuple[str, str]], prefix: str = CREATOR_FLOW.security_image_prefix
 ) -> str | None:
     if not images:
         print("安全验证结果未包含可显示的二维码截图。")
@@ -294,7 +340,7 @@ def write_and_open_security_image(
 
     suffix = ".png" if mime_type.lower() == "image/png" else ".png"
     fd, path = tempfile.mkstemp(
-        prefix="bunny-creator-security-",
+        prefix=prefix,
         suffix=suffix,
         dir=tempfile.gettempdir(),
     )
@@ -335,7 +381,7 @@ def is_valid_otp(otp: str) -> bool:
     return len(otp) == 6 and otp.isascii() and otp.isdigit()
 
 
-def main() -> int:
+def run_flow(flow: OTPFlow) -> int:
     if len(sys.argv) != 1:
         print("此工具不接受命令行参数；验证码必须交互式输入。", file=sys.stderr)
         return 2
@@ -345,30 +391,32 @@ def main() -> int:
     security_image_path: str | None = None
     try:
         print("正在连接远端 MCP 并完成 initialize…")
-        session_id = initialize()
+        session_id = initialize(flow)
         print("MCP initialize 成功。")
         print("连接已准备好；现在等待你本人输入验证码。")
         secret = read_otp()
-        message = call_creator_verify_otp(secret, session_id)
+        message = call_verify_otp(secret, session_id, flow)
         print_tool_result(message, secret)
         is_error, _, images = tool_result_parts(message)
         if is_error:
             return 1
 
         if is_security_verification_required(message):
-            security_image_path = write_and_open_security_image(images)
+            security_image_path = write_and_open_security_image(
+                images, prefix=flow.security_image_prefix
+            )
             print("请用手机完成小红书安全验证扫码；完成后回到此终端按 Enter。")
             input("已扫码后按 Enter 继续：")
-            complete_message = call_creator_complete_security_verification(session_id)
+            complete_message = call_complete_security_verification(session_id, flow)
             print_tool_result(complete_message, secret)
             complete_is_error, _, _ = tool_result_parts(complete_message)
             input("处理完成，按 Enter 关闭：")
             return 1 if complete_is_error else 0
 
         input("处理完成，按 Enter 关闭：")
-        return 0 if is_direct_success(message) else 1
+        return 0 if is_direct_success_for_flow(message, flow) else 1
     except KeyboardInterrupt:
-        print("\n已取消，未调用 creator_verify_otp。")
+        print(f"\n已取消，未调用 {flow.verify_tool}。")
         return 130
     except MCPClientError as exc:
         print(f"错误：{exc}", file=sys.stderr)
@@ -377,7 +425,11 @@ def main() -> int:
         # Best effort only; the OTP is not written to a file, log, or command line.
         best_effort_remove_temp_image(security_image_path)
         secret = ""
-        close_session(session_id)
+        close_session(session_id, flow.client_name)
+
+
+def main() -> int:
+    return run_flow(CREATOR_FLOW)
 
 
 if __name__ == "__main__":

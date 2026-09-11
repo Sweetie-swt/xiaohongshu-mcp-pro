@@ -47,7 +47,7 @@ func (s *AppServer) handleCheckLoginStatus(ctx context.Context) *MCPToolResult {
 	if status.IsLoggedIn {
 		resultText = fmt.Sprintf("✅ 已登录\n用户名: %s\n\n你可以使用其他功能了。", status.Username)
 	} else {
-		resultText = fmt.Sprintf("❌ 未登录\n\n请使用 get_login_qrcode 工具获取二维码进行登录。")
+		resultText = "❌ 未登录\nconsumer session not established：未检测到 www 消费端正向登录证据。\n\n请使用 consumer_phone_login / consumer_verify_otp 完成消费端手机号登录。"
 	}
 
 	return &MCPToolResult{
@@ -997,5 +997,93 @@ func (s *AppServer) handleCreatorCompleteSecurityVerification(ctx context.Contex
 	}
 	return &MCPToolResult{
 		Content: []MCPContent{{Type: "text", Text: "creator 登录成功，cookies 已保存。现在可以使用 publish_content 发布内容。"}},
+	}
+}
+
+// handleConsumerPhoneLogin 发起 www 消费端手机号登录（发送验证码）。
+func (s *AppServer) handleConsumerPhoneLogin(ctx context.Context, phone string) *MCPToolResult {
+	logrus.Info("MCP: consumer 手机号登录")
+
+	resp, err := s.xiaohongshuService.ConsumerPhoneLogin(phone)
+	if err != nil {
+		if resp != nil {
+			imgData := resp.Screenshot
+			if idx := strings.Index(imgData, ","); idx >= 0 {
+				imgData = imgData[idx+1:]
+			}
+			content := []MCPContent{{Type: "text", Text: resp.Message}}
+			if imgData != "" {
+				content = append(content, MCPContent{Type: "image", Data: imgData, MimeType: "image/png"})
+			}
+			return &MCPToolResult{Content: content, IsError: true}
+		}
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "consumer 发送验证码失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+
+	imgData := resp.Screenshot
+	if idx := strings.Index(imgData, ","); idx >= 0 {
+		imgData = imgData[idx+1:]
+	}
+	return &MCPToolResult{
+		Content: []MCPContent{
+			{Type: "text", Text: resp.Message},
+			{Type: "image", Data: imgData, MimeType: "image/png"},
+		},
+	}
+}
+
+// handleConsumerVerifyOTP 填写 www 消费端验证码。
+func (s *AppServer) handleConsumerVerifyOTP(ctx context.Context, otp string) *MCPToolResult {
+	logrus.Info("MCP: consumer 验证码登录")
+
+	result, err := s.xiaohongshuService.ConsumerVerifyOTP(otp)
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "consumer 验证码登录失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+	if result != nil && result.Status == xiaohongshu.OTPVerificationSecurityVerificationNeeded {
+		response := &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "security_verification_required：consumer 登录需要扫码完成安全验证，登录会话已保留。请查看截图扫码后调用 consumer_complete_security_verification。"}},
+		}
+		if result.SecurityQRShot != nil {
+			response.Content = append(response.Content, MCPContent{Type: "image", MimeType: "image/png", Data: encodeBase64(result.SecurityQRShot)})
+		}
+		return response
+	}
+	if result == nil || result.Status != xiaohongshu.OTPVerificationSucceeded {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "consumer 验证码登录失败：未返回明确成功状态"}},
+			IsError: true,
+		}
+	}
+	return &MCPToolResult{
+		Content: []MCPContent{{Type: "text", Text: "consumer 登录成功，www session 已通过正向页面验收并保存。"}},
+	}
+}
+
+// handleConsumerCompleteSecurityVerification 完成 www 消费端安全验证扫码阶段。
+func (s *AppServer) handleConsumerCompleteSecurityVerification(ctx context.Context) *MCPToolResult {
+	logrus.Info("MCP: consumer 完成安全验证")
+
+	result, err := s.xiaohongshuService.ConsumerCompleteSecurityVerification()
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "consumer 安全验证登录失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+	if result == nil || result.Status != xiaohongshu.OTPVerificationSucceeded {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "consumer 安全验证登录失败：未返回明确成功状态"}},
+			IsError: true,
+		}
+	}
+	return &MCPToolResult{
+		Content: []MCPContent{{Type: "text", Text: "consumer 登录成功，www session 已通过正向页面验收并保存。"}},
 	}
 }

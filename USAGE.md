@@ -119,6 +119,24 @@ get_login_qrcode()
 → 返回 base64 二维码图片（4 分钟有效），用小红书 App 扫码
 ```
 
+### 消费端手机号登录（用于 search_feeds）
+
+当 `check_login_status` 报告 `consumer session not established`，说明 Creator
+会话存在但 www 消费端尚未完成登录。此时使用独立的消费端登录链：
+
+```
+consumer_phone_login(phone="13800000000")
+→ www 登录弹窗发送验证码并返回截图
+
+# 在本地 Bunny terminal 运行 helper，交互式输入验证码；不要把 OTP 放入命令行或聊天
+python scripts/consumer_verify_otp_local.py
+→ 通过 www 正向登录证据后保存 consumer session
+```
+
+如果返回 `security_verification_required`，用小红书 App 完成截图中的安全验证，
+然后调用 `consumer_complete_security_verification`。完成后再次调用
+`check_login_status`，确认后再调用 `search_feeds`。
+
 ---
 
 ## 3. 发布图文内容

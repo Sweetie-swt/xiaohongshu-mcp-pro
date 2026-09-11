@@ -137,6 +137,16 @@ type CreatorVerifyOTPArgs struct {
 	OTP string `json:"otp" jsonschema:"收到的短信验证码"`
 }
 
+// ConsumerPhoneLoginArgs www 消费端手机号登录参数
+type ConsumerPhoneLoginArgs struct {
+	Phone string `json:"phone" jsonschema:"中国大陆手机号（11位数字）"`
+}
+
+// ConsumerVerifyOTPArgs www 消费端验证码参数
+type ConsumerVerifyOTPArgs struct {
+	OTP string `json:"otp" jsonschema:"收到的短信验证码"`
+}
+
 // InitMCPServer 初始化 MCP Server
 func InitMCPServer(appServer *AppServer) *mcp.Server {
 	// 创建 MCP Server
@@ -605,7 +615,54 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 		}),
 	)
 
-	logrus.Infof("Registered %d MCP tools", 21)
+	// 工具 22: consumer 手机号登录（发送验证码）
+	mcp.AddTool(server,
+		&mcp.Tool{
+			Name:        "consumer_phone_login",
+			Description: "向 www.xiaohongshu.com 的消费端登录弹窗发送手机验证码，返回截图。发送成功后需调用 consumer_verify_otp",
+			Annotations: &mcp.ToolAnnotations{
+				Title: "Consumer Phone Login",
+			},
+		},
+		withPanicRecovery("consumer_phone_login", func(ctx context.Context, req *mcp.CallToolRequest, args ConsumerPhoneLoginArgs) (*mcp.CallToolResult, any, error) {
+			result := appServer.handleConsumerPhoneLogin(ctx, args.Phone)
+			return convertToMCPResult(result), nil, nil
+		}),
+	)
+
+	// 工具 23: consumer 验证码登录
+	mcp.AddTool(server,
+		&mcp.Tool{
+			Name:        "consumer_verify_otp",
+			Description: "填写验证码完成 www.xiaohongshu.com 消费端登录，需先调用 consumer_phone_login",
+			Annotations: &mcp.ToolAnnotations{
+				Title:           "Consumer Verify OTP",
+				DestructiveHint: boolPtr(false),
+			},
+		},
+		withPanicRecovery("consumer_verify_otp", func(ctx context.Context, req *mcp.CallToolRequest, args ConsumerVerifyOTPArgs) (*mcp.CallToolResult, any, error) {
+			result := appServer.handleConsumerVerifyOTP(ctx, args.OTP)
+			return convertToMCPResult(result), nil, nil
+		}),
+	)
+
+	// 工具 24: consumer 完成安全验证
+	mcp.AddTool(server,
+		&mcp.Tool{
+			Name:        "consumer_complete_security_verification",
+			Description: "完成 consumer 登录中的安全验证扫码阶段，需先由 consumer_verify_otp 返回 security_verification_required",
+			Annotations: &mcp.ToolAnnotations{
+				Title:           "Consumer Complete Security Verification",
+				DestructiveHint: boolPtr(false),
+			},
+		},
+		withPanicRecovery("consumer_complete_security_verification", func(ctx context.Context, req *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, any, error) {
+			result := appServer.handleConsumerCompleteSecurityVerification(ctx)
+			return convertToMCPResult(result), nil, nil
+		}),
+	)
+
+	logrus.Infof("Registered %d MCP tools", 24)
 }
 
 // convertToMCPResult 将自定义的 MCPToolResult 转换为官方 SDK 的格式

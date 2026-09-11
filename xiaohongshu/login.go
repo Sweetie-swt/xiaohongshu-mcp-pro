@@ -47,6 +47,14 @@ func (a *LoginAction) CheckLoginStatus(ctx context.Context) (bool, error) {
 		logrus.Warnf("check_login_status: consumer auth gate visible: %s", gate.Description())
 		return false, nil
 	}
+	evidence, evidenceErr := WaitForConsumerLoginEvidence(pp, 5*time.Second)
+	if evidenceErr != nil {
+		return false, errors.Wrap(evidenceErr, "read consumer login evidence failed")
+	}
+	if !evidence.Present {
+		logrus.Warn("check_login_status: consumer cookie is present but no positive www login evidence was found")
+		return false, nil
+	}
 	return true, nil
 }
 

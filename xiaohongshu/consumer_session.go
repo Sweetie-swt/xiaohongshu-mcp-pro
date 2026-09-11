@@ -138,6 +138,46 @@ type ConsumerAuthGate struct {
 	TextPreview string `json:"text_preview"`
 }
 
+type ConsumerLoginEvidence struct {
+	Present  bool   `json:"present"`
+	Selector string `json:"selector"`
+	Marker   string `json:"marker"`
+}
+
+// ReadConsumerLoginEvidence reads a positive, consumer-side logged-in marker
+// from /explore. A valid cookie and the absence of a modal are not enough.
+func ReadConsumerLoginEvidence(page *rod.Page) (*ConsumerLoginEvidence, error) {
+	if page == nil {
+		return nil, fmt.Errorf("consumer login evidence: page is nil")
+	}
+	result, err := page.Eval(consumerLoginEvidenceScript)
+	if err != nil {
+		return nil, fmt.Errorf("evaluate consumer login evidence: %w", err)
+	}
+	var evidence ConsumerLoginEvidence
+	if err := json.Unmarshal([]byte(result.Value.String()), &evidence); err != nil {
+		return nil, fmt.Errorf("parse consumer login evidence: %w", err)
+	}
+	return &evidence, nil
+}
+
+func WaitForConsumerLoginEvidence(page *rod.Page, timeout time.Duration) (*ConsumerLoginEvidence, error) {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		evidence, err := ReadConsumerLoginEvidence(page)
+		if err != nil {
+			return nil, err
+		}
+		if evidence.Present || !time.Now().Before(deadline) {
+			return evidence, nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 func (g *ConsumerAuthGate) Description() string {
 	if g == nil || !g.Present {
 		return "no consumer auth gate"
@@ -209,7 +249,7 @@ const consumerAuthGateScript = `() => {
     const text = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 240);
     const signature = className + ' ' + id + ' ' + text;
     if (!modalPattern.test(signature) || !authPattern.test(signature)) continue;
-    const kind = /安全验证|身份验证|验证码|扫码|风控|verify|verification/i.test(signature)
+    const kind = /安全验证|安全校验|身份验证|身份校验|二次验证|二次校验|人机验证|人机校验|风险验证|风险校验|风控验证|扫码验证|security verification|risk verification/i.test(signature)
       ? 'verification' : 'login';
     return JSON.stringify({
       present: true,
@@ -232,7 +272,7 @@ const consumerAuthGateScript = `() => {
     if (mask) {
       return JSON.stringify({
         present: true,
-        kind: /安全验证|身份验证|风险验证|风控验证/.test(bodyText) ? 'verification' : 'login',
+        kind: /安全验证|安全校验|身份验证|身份校验|二次验证|二次校验|人机验证|人机校验|风险验证|风险校验|风控验证|扫码验证/.test(bodyText) ? 'verification' : 'login',
         selector: 'body-auth-text-with-mask',
         tag: String(mask.tagName || '').toLowerCase(),
         id: String(mask.id || '').slice(0, 120),
@@ -243,4 +283,32 @@ const consumerAuthGateScript = `() => {
   }
 
   return JSON.stringify({present: false});
+}`
+
+const consumerLoginEvidenceScript = `() => {
+  const visible = (node) => {
+    if (!node || node.nodeType !== 1) return false;
+    const style = window.getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0 &&
+      node.getAttribute('aria-hidden') !== 'true';
+  };
+
+  // The first selector is the marker used by the current profile-page
+  // navigation code. The second is the narrower legacy equivalent used by
+  // LoginAction. Both require visible non-login text, so an anonymous login
+  // link cannot satisfy the positive signal.
+  const selectors = [
+    'div.main-container li.user.side-bar-component a.link-wrapper span.channel',
+    '.main-container .user .link-wrapper .channel'
+  ];
+  for (const selector of selectors) {
+    const node = document.querySelector(selector);
+    const text = node ? String(node.textContent || '').replace(/\s+/g, ' ').trim() : '';
+    if (visible(node) && text && !/^登录$|^注册$|登录注册/.test(text)) {
+      return JSON.stringify({present: true, selector, marker: 'visible-user-channel'});
+    }
+  }
+  return JSON.stringify({present: false, selector: '', marker: ''});
 }`

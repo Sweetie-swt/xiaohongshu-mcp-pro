@@ -25,6 +25,10 @@ type XiaohongshuService struct {
 	creatorLoginBrowser *browser.ProfileBrowser
 	creatorLoginPage    *rod.Page
 
+	// consumerLoginBrowser/Page 用于 www 消费端手机号登录流程（跨两次 MCP 调用）
+	consumerLoginBrowser *browser.ProfileBrowser
+	consumerLoginPage    *rod.Page
+
 	// 以下函数仅用于隔离 creator 登录流程的单元测试；生产环境保持 nil，走真实实现。
 	creatorVerifyOTPFunc          func(*rod.Page, string) (*xiaohongshu.OTPVerificationResult, error)
 	creatorWaitSecurityVerifyFunc func(*rod.Page, time.Duration) error
@@ -618,6 +622,9 @@ type CreatorPhoneLoginResponse struct {
 
 // CreatorPhoneLogin 导航到 creator 登录页并发送短信验证码，返回截图供用户确认
 func (s *XiaohongshuService) CreatorPhoneLogin(phone string) (*CreatorPhoneLoginResponse, error) {
+	if s.consumerLoginBrowser != nil {
+		return nil, fmt.Errorf("consumer 登录会话仍在进行，请先完成或结束 consumer 登录流程")
+	}
 	// 关闭上一次未完成的 creator 登录浏览器
 	if s.creatorLoginBrowser != nil {
 		s.releaseCreatorLoginSession(s.creatorLoginBrowser, s.creatorLoginPage)
@@ -658,6 +665,174 @@ func (s *XiaohongshuService) CreatorPhoneLogin(phone string) (*CreatorPhoneLogin
 		Screenshot: fmt.Sprintf("data:image/png;base64,%s", encodeBase64(otpResult.Screenshot)),
 		Message:    otpResult.Message,
 	}, nil
+}
+
+// ConsumerPhoneLoginResponse consumer www 手机号登录响应。
+type ConsumerPhoneLoginResponse struct {
+	Screenshot string `json:"screenshot"`
+	Message    string `json:"message"`
+}
+
+// ConsumerPhoneLogin 在 www 消费端登录弹窗中发送短信验证码。
+// 浏览器/page 会保留到 ConsumerVerifyOTP 或 ConsumerCompleteSecurityVerification。
+func (s *XiaohongshuService) ConsumerPhoneLogin(phone string) (*ConsumerPhoneLoginResponse, error) {
+	if s.creatorLoginBrowser != nil {
+		return nil, fmt.Errorf("creator 登录会话仍在进行，请先完成或结束 creator 登录流程")
+	}
+	if s.consumerLoginBrowser != nil {
+		s.releaseConsumerLoginSession(s.consumerLoginBrowser, s.consumerLoginPage)
+	}
+
+	b := newProfileBrowser()
+	page := b.NewPage()
+	action := xiaohongshu.NewConsumerLogin(page)
+	if _, err := action.NavigateToLogin(); err != nil {
+		_ = page.Close()
+		b.Close()
+		return nil, err
+	}
+
+	otpResult, err := action.SendOTP(phone)
+	if err != nil || otpResult == nil ||
+		(otpResult.Status != xiaohongshu.OTPSendConfirmed && otpResult.Status != xiaohongshu.OTPSendUncertain) {
+		_ = page.Close()
+		b.Close()
+		if otpResult == nil {
+			if err == nil {
+				err = fmt.Errorf("consumer 验证码发送失败：未返回有效发送状态")
+			}
+			return nil, err
+		}
+		if err == nil {
+			err = fmt.Errorf("consumer 验证码发送失败：状态 %q 不允许保留登录会话", otpResult.Status)
+		}
+		return &ConsumerPhoneLoginResponse{
+			Screenshot: fmt.Sprintf("data:image/png;base64,%s", encodeBase64(otpResult.Screenshot)),
+			Message:    otpResult.Message,
+		}, err
+	}
+
+	s.consumerLoginBrowser = b
+	s.consumerLoginPage = page
+	return &ConsumerPhoneLoginResponse{
+		Screenshot: fmt.Sprintf("data:image/png;base64,%s", encodeBase64(otpResult.Screenshot)),
+		Message:    otpResult.Message,
+	}, nil
+}
+
+type ConsumerVerifyOTPResult struct {
+	Status         xiaohongshu.OTPVerificationStatus `json:"status"`
+	SecurityQRShot []byte                            `json:"-"`
+}
+
+// ConsumerVerifyOTP 提交 www 消费端验证码；OTP 仅在本次内存调用中传递。
+func (s *XiaohongshuService) ConsumerVerifyOTP(otp string) (*ConsumerVerifyOTPResult, error) {
+	if s.consumerLoginPage == nil || s.consumerLoginBrowser == nil {
+		return nil, fmt.Errorf("请先调用 consumer_phone_login 发送验证码")
+	}
+
+	b := s.consumerLoginBrowser
+	page := s.consumerLoginPage
+	verification, err := xiaohongshu.NewConsumerLogin(page).VerifyOTP(otp)
+	if err != nil {
+		s.releaseConsumerLoginSession(b, page)
+		return nil, err
+	}
+	if verification == nil {
+		s.releaseConsumerLoginSession(b, page)
+		return nil, fmt.Errorf("consumer 验证码登录未返回有效状态")
+	}
+	if verification.Status == xiaohongshu.OTPVerificationSecurityVerificationNeeded {
+		return &ConsumerVerifyOTPResult{
+			Status:         verification.Status,
+			SecurityQRShot: verification.SecurityVerificationQR,
+		}, nil
+	}
+
+	if err := s.finalizeConsumerLogin(page); err != nil {
+		s.releaseConsumerLoginSession(b, page)
+		return nil, err
+	}
+	s.releaseConsumerLoginSession(b, page)
+	return &ConsumerVerifyOTPResult{Status: xiaohongshu.OTPVerificationSucceeded}, nil
+}
+
+// ConsumerCompleteSecurityVerification 完成 www 消费端手机号登录的二次验证。
+func (s *XiaohongshuService) ConsumerCompleteSecurityVerification() (*ConsumerVerifyOTPResult, error) {
+	if s.consumerLoginPage == nil || s.consumerLoginBrowser == nil {
+		return nil, fmt.Errorf("没有活跃的 consumer 登录会话，请先调用 consumer_phone_login 和 consumer_verify_otp")
+	}
+
+	b := s.consumerLoginBrowser
+	page := s.consumerLoginPage
+	if err := xiaohongshu.NewConsumerLogin(page).WaitForSecurityVerification(120 * time.Second); err != nil {
+		s.releaseConsumerLoginSession(b, page)
+		return nil, err
+	}
+	if err := s.finalizeConsumerLogin(page); err != nil {
+		s.releaseConsumerLoginSession(b, page)
+		return nil, err
+	}
+	s.releaseConsumerLoginSession(b, page)
+	return &ConsumerVerifyOTPResult{Status: xiaohongshu.OTPVerificationSucceeded}, nil
+}
+
+func (s *XiaohongshuService) finalizeConsumerLogin(page *rod.Page) error {
+	if page == nil {
+		return fmt.Errorf("consumer 登录页面不可用")
+	}
+	consumerCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pp := page.Context(consumerCtx)
+	if err := pp.WaitLoad(); err != nil {
+		logrus.Warnf("www consumer 登录后 WaitLoad 未完成，继续验收页面状态: %v", err)
+	}
+	time.Sleep(2 * time.Second)
+
+	if err := xiaohongshu.LogConsumerCookieMetadata(page, "consumer finalize"); err != nil {
+		return fmt.Errorf("consumer cookie metadata unavailable: %w", err)
+	}
+	status, err := xiaohongshu.ReadConsumerCookieStatus(page)
+	if err != nil {
+		return fmt.Errorf("consumer cookie status unavailable: %w", err)
+	}
+	gate, err := xiaohongshu.ReadConsumerAuthGate(pp)
+	if err != nil {
+		return fmt.Errorf("consumer auth state unavailable: %w", err)
+	}
+	if gate.Present {
+		return fmt.Errorf("consumer session not established: authentication gate visible (%s)", gate.Description())
+	}
+	if !status.HasValidConsumerSession() {
+		return fmt.Errorf("consumer session not established: %s", status.Summary())
+	}
+	evidence, err := xiaohongshu.WaitForConsumerLoginEvidence(pp, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("consumer login evidence unavailable: %w", err)
+	}
+	if !evidence.Present {
+		return fmt.Errorf("consumer session not established: no positive consumer login evidence")
+	}
+	if err := saveCookies(page); err != nil {
+		return fmt.Errorf("consumer 登录后保存 cookies 失败: %w", err)
+	}
+	logrus.Info("consumer session 已通过正向页面验收并保存到 profile 及 cookies.json")
+	return nil
+}
+
+func (s *XiaohongshuService) releaseConsumerLoginSession(b *browser.ProfileBrowser, page *rod.Page) {
+	if s.consumerLoginBrowser == b {
+		s.consumerLoginBrowser = nil
+	}
+	if s.consumerLoginPage == page {
+		s.consumerLoginPage = nil
+	}
+	if page != nil {
+		_ = page.Close()
+	}
+	if b != nil {
+		b.Close()
+	}
 }
 
 func (s *XiaohongshuService) retainCreatorLoginSession(b *browser.ProfileBrowser, page *rod.Page, result *xiaohongshu.OTPSendResult, sendErr error) bool {
@@ -794,6 +969,13 @@ func (s *XiaohongshuService) finalizeCreatorLogin(page *rod.Page) error {
 	}
 	if !cookieStatus.HasValidConsumerSession() {
 		return fmt.Errorf("www consumer session not established: %s", cookieStatus.Summary())
+	}
+	evidence, err := xiaohongshu.WaitForConsumerLoginEvidence(wwwPP, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("www consumer login evidence unavailable: %w", err)
+	}
+	if !evidence.Present {
+		return fmt.Errorf("www consumer session not established: no positive consumer login evidence")
 	}
 
 	// 同时保存 cookies 到 JSON（向后兼容 www 操作的 CDP 注入）

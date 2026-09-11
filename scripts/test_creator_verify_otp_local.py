@@ -14,6 +14,26 @@ SPEC.loader.exec_module(helper)
 
 
 class CreatorVerifyOTPLocalTests(unittest.TestCase):
+    def test_consumer_flow_uses_consumer_tools_without_changing_creator_flow(self) -> None:
+        self.assertEqual(helper.CREATOR_FLOW.verify_tool, "creator_verify_otp")
+        self.assertEqual(helper.CONSUMER_FLOW.verify_tool, "consumer_verify_otp")
+        self.assertEqual(
+            helper.CONSUMER_FLOW.complete_security_tool,
+            "consumer_complete_security_verification",
+        )
+        self.assertEqual(
+            helper.is_direct_success_for_flow(
+                {
+                    "result": {
+                        "isError": False,
+                        "content": [{"type": "text", "text": "consumer 登录成功"}],
+                    }
+                },
+                helper.CONSUMER_FLOW,
+            ),
+            True,
+        )
+
     def test_otp_validation_is_local_only(self) -> None:
         self.assertTrue(helper.is_valid_otp("111111"))
         self.assertFalse(helper.is_valid_otp("12345"))
