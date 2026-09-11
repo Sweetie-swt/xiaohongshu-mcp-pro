@@ -107,6 +107,9 @@ func TestConsumerCustomAgreementFallbackIsScopedAndReadOnly(t *testing.T) {
 	for _, fragment := range []string{"div.icon-wrapper", "computed_style", "icon_nodes", "pointer_events"} {
 		require.Contains(t, consumerCustomAgreementFingerprintScript, fragment)
 	}
+	require.Contains(t, consumerCustomAgreementStateScript, "div.icon-wrapper.agreed")
+	require.Contains(t, consumerCustomAgreementStateScript, "svg.reds-icon.icon")
+	require.NotContains(t, consumerCustomAgreementStateScript, "querySelectorAll('.agree-icon')")
 	require.NotContains(t, consumerCustomAgreementIconScript, ".click()")
 	require.NotContains(t, consumerCustomAgreementFingerprintScript, ".click()")
 	require.NotContains(t, consumerCustomAgreementIconScript, "input[type=\"checkbox\"]")
@@ -131,6 +134,28 @@ func TestConsumerCustomAgreementFingerprintTransitionDetectsStructuralChange(t *
 func TestConsumerCustomAgreementResultDefaultsToNoInteraction(t *testing.T) {
 	result := &consumerCustomAgreementResult{}
 	require.False(t, result.Found)
+	require.False(t, result.AlreadyAgreed)
 	require.False(t, result.Clicked)
-	require.False(t, result.Transition)
+	require.False(t, result.Confirmed)
+}
+
+func TestConsumerCustomAgreementStateRequiresAgreedWrapper(t *testing.T) {
+	require.False(t, consumerCustomAgreementStateConfirmed(consumerCustomAgreementState{}))
+	require.False(t, consumerCustomAgreementStateConfirmed(consumerCustomAgreementState{Found: true}))
+	require.True(t, consumerCustomAgreementStateConfirmed(consumerCustomAgreementState{
+		Found:         true,
+		AlreadyAgreed: true,
+	}))
+}
+
+func TestConsumerAgreementReadyForOTPSendPreservesStandardAndCustomPriority(t *testing.T) {
+	require.False(t, consumerShouldUseCustomAgreement(consumerAgreementDiagnostics{Found: 1}))
+	require.True(t, consumerShouldUseCustomAgreement(consumerAgreementDiagnostics{}))
+	require.True(t, consumerAgreementReadyForOTPSend(
+		consumerAgreementDiagnostics{Found: 1}, nil))
+	require.True(t, consumerAgreementReadyForOTPSend(
+		consumerAgreementDiagnostics{}, &consumerCustomAgreementResult{Found: true, Confirmed: true}))
+	require.False(t, consumerAgreementReadyForOTPSend(
+		consumerAgreementDiagnostics{}, &consumerCustomAgreementResult{Found: true, Confirmed: false}))
+	require.False(t, consumerAgreementReadyForOTPSend(consumerAgreementDiagnostics{}, nil))
 }

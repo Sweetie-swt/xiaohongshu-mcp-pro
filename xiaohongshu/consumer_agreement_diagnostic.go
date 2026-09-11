@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -94,25 +95,36 @@ type consumerCustomAgreementFingerprint struct {
 	IconWrapper consumerCustomNodeFingerprint `json:"icon_wrapper"`
 }
 
+type consumerCustomAgreementState struct {
+	Found         bool `json:"found"`
+	AlreadyAgreed bool `json:"already_agreed"`
+	HasSVGIcon    bool `json:"has_svg_icon"`
+}
+
 type consumerCustomAgreementResult struct {
-	Found      bool                               `json:"custom_agreement_found"`
-	Clicked    bool                               `json:"custom_agreement_clicked"`
-	Transition bool                               `json:"custom_agreement_transition"`
-	Before     consumerCustomAgreementFingerprint `json:"before"`
-	After      consumerCustomAgreementFingerprint `json:"after"`
-	Error      string                             `json:"error,omitempty"`
+	Found         bool   `json:"custom_agreement_found"`
+	AlreadyAgreed bool   `json:"custom_agreement_already_agreed"`
+	Clicked       bool   `json:"custom_agreement_clicked"`
+	Confirmed     bool   `json:"custom_agreement_confirmed"`
+	HasSVGIcon    bool   `json:"custom_agreement_svg_icon"`
+	Error         string `json:"error,omitempty"`
 }
 
 func (a *ConsumerLoginAction) ensureConsumerCustomAgreementChecked() (*consumerCustomAgreementResult, error) {
 	result := &consumerCustomAgreementResult{}
-	before, err := a.readConsumerCustomAgreementFingerprint()
+	before, err := a.readConsumerCustomAgreementState()
 	if err != nil {
-		result.Error = "custom agreement fingerprint before failed: " + err.Error()
+		result.Error = "custom agreement state before failed: " + err.Error()
 		return result, err
 	}
-	result.Before = before
 	result.Found = before.Found
 	if !before.Found {
+		return result, nil
+	}
+	result.AlreadyAgreed = before.AlreadyAgreed
+	result.HasSVGIcon = before.HasSVGIcon
+	if consumerCustomAgreementStateConfirmed(before) {
+		result.Confirmed = true
 		return result, nil
 	}
 
@@ -127,16 +139,41 @@ func (a *ConsumerLoginAction) ensureConsumerCustomAgreementChecked() (*consumerC
 		return result, err
 	}
 	result.Clicked = true
-	time.Sleep(500 * time.Millisecond)
-
-	after, err := a.readConsumerCustomAgreementFingerprint()
-	if err != nil {
-		result.Error = "custom agreement fingerprint after failed: " + err.Error()
-		return result, err
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		after, stateErr := a.readConsumerCustomAgreementState()
+		if stateErr != nil {
+			result.Error = "custom agreement state after failed: " + stateErr.Error()
+			return result, stateErr
+		}
+		result.HasSVGIcon = after.HasSVGIcon
+		if consumerCustomAgreementStateConfirmed(after) {
+			result.Confirmed = true
+			return result, nil
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	result.After = after
-	result.Transition = consumerCustomAgreementFingerprintChanged(before, after)
-	return result, nil
+	result.Error = "custom agreement click 后未观察到 div.icon-wrapper.agreed"
+	return result, errors.New(result.Error)
+}
+
+func consumerCustomAgreementStateConfirmed(state consumerCustomAgreementState) bool {
+	return state.Found && state.AlreadyAgreed
+}
+
+func (a *ConsumerLoginAction) readConsumerCustomAgreementState() (consumerCustomAgreementState, error) {
+	result, err := a.page.Eval(consumerCustomAgreementStateScript)
+	if err != nil {
+		return consumerCustomAgreementState{}, err
+	}
+	var state consumerCustomAgreementState
+	if err := json.Unmarshal([]byte(result.Value.String()), &state); err != nil {
+		return consumerCustomAgreementState{}, err
+	}
+	return state, nil
 }
 
 func (a *ConsumerLoginAction) readConsumerCustomAgreementFingerprint() (consumerCustomAgreementFingerprint, error) {
@@ -164,13 +201,8 @@ func (a *ConsumerLoginAction) logConsumerCustomAgreementResult(result *consumerC
 	if result == nil {
 		return
 	}
-	data, err := json.Marshal(result)
-	if err != nil {
-		logrus.Warnf("consumer custom agreement fingerprint marshal failed: %v", err)
-		return
-	}
-	logrus.Infof("custom_agreement_found=%t custom_agreement_clicked=%t custom_agreement_transition=%t before_after=%s",
-		result.Found, result.Clicked, result.Transition, sanitizeConsumerDiagnosticJSON(data))
+	logrus.Infof("custom_agreement_found=%t custom_agreement_already_agreed=%t custom_agreement_clicked=%t custom_agreement_confirmed=%t custom_agreement_svg_icon=%t",
+		result.Found, result.AlreadyAgreed, result.Clicked, result.Confirmed, result.HasSVGIcon)
 }
 
 const consumerCustomAgreementIconScript = `() => {
@@ -197,6 +229,35 @@ const consumerCustomAgreementIconScript = `() => {
     return null;
   };
   return semanticArea();
+}`
+
+const consumerCustomAgreementStateScript = `() => {
+  const visible = (node) => {
+    if (!node || node.nodeType !== 1) return false;
+    const style = window.getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0 &&
+      node.getAttribute('aria-hidden') !== 'true';
+  };
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  for (const area of document.querySelectorAll('div.agreements')) {
+    if (!visible(area)) continue;
+    const text = normalize(area.innerText || area.textContent || '');
+    if (!text.includes('我已阅读并同意')) continue;
+    if (!(text.includes('用户协议') || text.includes('隐私政策') ||
+      text.includes('隐私协议') || text.includes('隐私条款') ||
+      text.includes('服务条款') || text.includes('相关协议'))) continue;
+    const icon = area.querySelector('span.agree-icon');
+    if (!visible(icon)) continue;
+    const wrapper = icon.querySelector('div.icon-wrapper');
+    return JSON.stringify({
+      found: true,
+      already_agreed: !!wrapper && wrapper.matches('div.icon-wrapper.agreed'),
+      has_svg_icon: !!wrapper && !!wrapper.querySelector('svg.reds-icon.icon')
+    });
+  }
+  return JSON.stringify({found: false, already_agreed: false, has_svg_icon: false});
 }`
 
 const consumerCustomAgreementFingerprintScript = `() => {

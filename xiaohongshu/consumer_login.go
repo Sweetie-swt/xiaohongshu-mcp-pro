@@ -129,44 +129,18 @@ func (a *ConsumerLoginAction) SendOTP(phone string) (*OTPSendResult, error) {
 	a.logConsumerAgreementDiagnostics("协议处理后", agreement)
 	if customAgreement != nil {
 		a.logConsumerCustomAgreementResult(customAgreement)
-		if customAgreement.Found {
-			message := fmt.Sprintf("consumer custom agreement diagnostic-only: custom_agreement_found=true custom_agreement_clicked=%t custom_agreement_transition=%t；未点击获取验证码，未发送短信。",
-				customAgreement.Clicked, customAgreement.Transition)
-			if !customAgreement.Transition {
-				message += " diagnostic inconclusive。"
-			}
-			if customAgreement.Error != "" {
-				message += " " + customAgreement.Error
-			}
-			return &OTPSendResult{Status: OTPSendFailed, Message: message}, errors.New("consumer 自定义协议控件已观测，已进入 diagnostic-only 分支")
-		}
-	}
-	if agreement.Found == 0 {
-		candidateCount, diagnosticErr := a.logConsumerAgreementDOMDiagnostic()
-		customFound := false
-		customClicked := false
-		customTransition := false
-		customError := ""
-		if customAgreement != nil {
-			customFound = customAgreement.Found
-			customClicked = customAgreement.Clicked
-			customTransition = customAgreement.Transition
-			customError = customAgreement.Error
-		}
-		message := fmt.Sprintf("consumer 协议诊断完成：未识别到协议控件，命中结构区域=%d custom_agreement_found=%t custom_agreement_clicked=%t custom_agreement_transition=%t；未点击获取验证码，未发送短信。",
-			candidateCount, customFound, customClicked, customTransition)
-		if customError != "" {
-			message += " " + customError
-		}
-		if diagnosticErr != nil {
-			message += " DOM 诊断失败：" + diagnosticErr.Error()
-		}
-		return &OTPSendResult{Status: OTPSendFailed, Message: message}, errors.New("consumer 协议控件未识别，已进入 diagnostic-only 分支")
 	}
 	if agreementErr != nil {
 		shot, _ := pp.Screenshot(false, nil)
 		saveDebugShot("consumer-login-agreement-check", shot)
 		return &OTPSendResult{Screenshot: shot, Status: OTPSendFailed, Message: "consumer 验证码发送失败：" + agreementErr.Error()}, agreementErr
+	}
+	if !consumerAgreementReadyForOTPSend(agreement, customAgreement) {
+		message := "consumer 验证码发送失败：协议未确认，未点击获取验证码"
+		if customAgreement != nil && customAgreement.Error != "" {
+			message += "；" + customAgreement.Error
+		}
+		return &OTPSendResult{Status: OTPSendFailed, Message: message}, errors.New(message)
 	}
 	afterAgreement := a.collectConsumerOTPPageDiagnostics()
 	a.logConsumerOTPPageDiagnostics("协议处理后页面状态", afterAgreement)
@@ -204,6 +178,13 @@ func (a *ConsumerLoginAction) SendOTP(phone string) (*OTPSendResult, error) {
 		return &OTPSendResult{Screenshot: shot, Status: status, Message: message}, errors.New(message)
 	}
 	return &OTPSendResult{Screenshot: shot, Status: status, Message: message}, nil
+}
+
+func consumerAgreementReadyForOTPSend(standard consumerAgreementDiagnostics, custom *consumerCustomAgreementResult) bool {
+	if standard.Found > 0 {
+		return true
+	}
+	return custom != nil && custom.Confirmed
 }
 
 func (a *ConsumerLoginAction) collectConsumerOTPPageDiagnostics() consumerOTPPageDiagnostics {
@@ -252,7 +233,7 @@ func (a *ConsumerLoginAction) ensureConsumerAgreementChecked() (consumerAgreemen
 	if err != nil {
 		return diagnostics, nil, errors.Wrap(err, "读取 consumer 登录协议 checkbox 失败")
 	}
-	if diagnostics.Found == 0 {
+	if consumerShouldUseCustomAgreement(diagnostics) {
 		custom, customErr := a.ensureConsumerCustomAgreementChecked()
 		return diagnostics, custom, customErr
 	}
@@ -260,6 +241,10 @@ func (a *ConsumerLoginAction) ensureConsumerAgreementChecked() (consumerAgreemen
 		return diagnostics, nil, errors.New("已识别到未勾选的 consumer 用户协议/隐私政策 checkbox，但勾选后仍未选中")
 	}
 	return diagnostics, nil, nil
+}
+
+func consumerShouldUseCustomAgreement(standard consumerAgreementDiagnostics) bool {
+	return standard.Found == 0
 }
 
 func (a *ConsumerLoginAction) logConsumerAgreementDiagnostics(stage string, diagnostics consumerAgreementDiagnostics) {
