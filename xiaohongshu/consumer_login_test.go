@@ -92,3 +92,45 @@ func TestConsumerAgreementDOMDiagnosticIsReadOnlyAndStructural(t *testing.T) {
 	require.NotContains(t, consumerAgreementDOMDiagnosticScript, "input.value")
 	require.NotContains(t, consumerAgreementDOMDiagnosticScript, ".click()")
 }
+
+func TestConsumerCustomAgreementFallbackIsScopedAndReadOnly(t *testing.T) {
+	for _, fragment := range []string{
+		"div.agreements",
+		"span.agree-icon",
+		"我已阅读并同意",
+		"用户协议",
+		"隐私政策",
+	} {
+		require.Contains(t, consumerCustomAgreementIconScript, fragment)
+		require.Contains(t, consumerCustomAgreementFingerprintScript, fragment)
+	}
+	for _, fragment := range []string{"div.icon-wrapper", "computed_style", "icon_nodes", "pointer_events"} {
+		require.Contains(t, consumerCustomAgreementFingerprintScript, fragment)
+	}
+	require.NotContains(t, consumerCustomAgreementIconScript, ".click()")
+	require.NotContains(t, consumerCustomAgreementFingerprintScript, ".click()")
+	require.NotContains(t, consumerCustomAgreementIconScript, "input[type=\"checkbox\"]")
+}
+
+func TestConsumerCustomAgreementFingerprintTransitionDetectsStructuralChange(t *testing.T) {
+	before := consumerCustomAgreementFingerprint{
+		Found: true,
+		Icon: consumerCustomNodeFingerprint{
+			ClassName:     "agree-icon",
+			ComputedStyle: consumerCustomComputedStyle{Background: "transparent"},
+		},
+	}
+	after := before
+	after.Icon.ClassName = "agree-icon selected"
+	after.Icon.ComputedStyle.Background = "rgb(255, 36, 66)"
+
+	require.True(t, consumerCustomAgreementFingerprintChanged(before, after))
+	require.False(t, consumerCustomAgreementFingerprintChanged(before, before))
+}
+
+func TestConsumerCustomAgreementResultDefaultsToNoInteraction(t *testing.T) {
+	result := &consumerCustomAgreementResult{}
+	require.False(t, result.Found)
+	require.False(t, result.Clicked)
+	require.False(t, result.Transition)
+}
