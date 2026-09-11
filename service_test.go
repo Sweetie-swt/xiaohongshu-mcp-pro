@@ -414,8 +414,8 @@ func TestMCPToolRegistrationCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := len(result.Tools); got != 24 {
-		t.Fatalf("registered MCP tools=%d, want 24", got)
+	if got := len(result.Tools); got != 26 {
+		t.Fatalf("registered MCP tools=%d, want 26", got)
 	}
 	names := make(map[string]bool, len(result.Tools))
 	for _, tool := range result.Tools {
@@ -425,6 +425,8 @@ func TestMCPToolRegistrationCount(t *testing.T) {
 		"consumer_phone_login",
 		"consumer_verify_otp",
 		"consumer_complete_security_verification",
+		"consumer_qr_login",
+		"consumer_complete_qr_login",
 	} {
 		if !names[name] {
 			t.Fatalf("missing consumer MCP tool %q", name)

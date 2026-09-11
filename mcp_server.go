@@ -662,7 +662,38 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 		}),
 	)
 
-	logrus.Infof("Registered %d MCP tools", 24)
+	// 工具 25: consumer 普通二维码登录
+	mcp.AddTool(server,
+		&mcp.Tool{
+			Name:        "consumer_qr_login",
+			Description: "打开 www.xiaohongshu.com 消费端普通二维码登录，返回二维码图片；不会发送短信或接收 OTP，需随后调用 consumer_complete_qr_login",
+			Annotations: &mcp.ToolAnnotations{
+				Title: "Consumer QR Login",
+			},
+		},
+		withPanicRecovery("consumer_qr_login", func(ctx context.Context, req *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, any, error) {
+			result := appServer.handleConsumerQRLogin(ctx)
+			return convertToMCPResult(result), nil, nil
+		}),
+	)
+
+	// 工具 26: consumer 普通二维码登录完成
+	mcp.AddTool(server,
+		&mcp.Tool{
+			Name:        "consumer_complete_qr_login",
+			Description: "等待已有 consumer 普通二维码登录完成；不会创建或刷新第二张二维码，成功后执行 consumer-specific 正向页面验收",
+			Annotations: &mcp.ToolAnnotations{
+				Title:           "Consumer Complete QR Login",
+				DestructiveHint: boolPtr(false),
+			},
+		},
+		withPanicRecovery("consumer_complete_qr_login", func(ctx context.Context, req *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, any, error) {
+			result := appServer.handleConsumerCompleteQRLogin(ctx)
+			return convertToMCPResult(result), nil, nil
+		}),
+	)
+
+	logrus.Infof("Registered %d MCP tools", 26)
 }
 
 // convertToMCPResult 将自定义的 MCPToolResult 转换为官方 SDK 的格式

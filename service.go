@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -29,11 +30,23 @@ type XiaohongshuService struct {
 	consumerLoginBrowser *browser.ProfileBrowser
 	consumerLoginPage    *rod.Page
 
+	// consumerQRLoginBrowser/Page 用于 www 消费端二维码登录流程（跨两次 MCP 调用）
+	consumerQRLoginBrowser *browser.ProfileBrowser
+	consumerQRLoginPage    *rod.Page
+
+	// loginFlowMu 串行化跨调用的 creator/consumer 登录状态，避免两个流程
+	// 同时争抢同一个持久 profile。
+	loginFlowMu sync.Mutex
+
 	// 以下函数仅用于隔离 creator 登录流程的单元测试；生产环境保持 nil，走真实实现。
 	creatorVerifyOTPFunc          func(*rod.Page, string) (*xiaohongshu.OTPVerificationResult, error)
 	creatorWaitSecurityVerifyFunc func(*rod.Page, time.Duration) error
 	creatorFinalizeLoginFunc      func(*rod.Page) error
 	creatorCloseLoginSessionFunc  func(*browser.ProfileBrowser, *rod.Page)
+	// 以下函数仅用于隔离 consumer QR 登录流程的单元测试；生产环境保持 nil。
+	consumerQRWaitFunc              func(context.Context, *rod.Page, time.Duration) (xiaohongshu.ConsumerQRCodeWaitStatus, error)
+	consumerQRFinalizeLoginFunc     func(*rod.Page) error
+	consumerQRCloseLoginSessionFunc func(*browser.ProfileBrowser, *rod.Page)
 }
 
 // NewXiaohongshuService 创建小红书服务实例
@@ -622,11 +635,14 @@ type CreatorPhoneLoginResponse struct {
 
 // CreatorPhoneLogin 导航到 creator 登录页并发送短信验证码，返回截图供用户确认
 func (s *XiaohongshuService) CreatorPhoneLogin(phone string) (*CreatorPhoneLoginResponse, error) {
-	if s.consumerLoginBrowser != nil {
+	s.loginFlowMu.Lock()
+	defer s.loginFlowMu.Unlock()
+
+	if s.consumerLoginBrowser != nil || s.consumerLoginPage != nil || s.consumerQRLoginBrowser != nil || s.consumerQRLoginPage != nil {
 		return nil, fmt.Errorf("consumer 登录会话仍在进行，请先完成或结束 consumer 登录流程")
 	}
 	// 关闭上一次未完成的 creator 登录浏览器
-	if s.creatorLoginBrowser != nil {
+	if s.creatorLoginBrowser != nil || s.creatorLoginPage != nil {
 		s.releaseCreatorLoginSession(s.creatorLoginBrowser, s.creatorLoginPage)
 	}
 
@@ -677,10 +693,16 @@ type ConsumerPhoneLoginResponse struct {
 // ConsumerPhoneLogin 在 www 消费端登录弹窗中发送短信验证码。
 // 浏览器/page 会保留到 ConsumerVerifyOTP 或 ConsumerCompleteSecurityVerification。
 func (s *XiaohongshuService) ConsumerPhoneLogin(phone string) (*ConsumerPhoneLoginResponse, error) {
-	if s.creatorLoginBrowser != nil {
+	s.loginFlowMu.Lock()
+	defer s.loginFlowMu.Unlock()
+
+	if s.creatorLoginBrowser != nil || s.creatorLoginPage != nil {
 		return nil, fmt.Errorf("creator 登录会话仍在进行，请先完成或结束 creator 登录流程")
 	}
-	if s.consumerLoginBrowser != nil {
+	if s.consumerQRLoginBrowser != nil || s.consumerQRLoginPage != nil {
+		return nil, fmt.Errorf("consumer QR 登录会话仍在进行，请先完成或结束 consumer QR 登录流程")
+	}
+	if s.consumerLoginBrowser != nil || s.consumerLoginPage != nil {
 		s.releaseConsumerLoginSession(s.consumerLoginBrowser, s.consumerLoginPage)
 	}
 
@@ -730,6 +752,9 @@ type ConsumerVerifyOTPResult struct {
 
 // ConsumerVerifyOTP 提交 www 消费端验证码；OTP 仅在本次内存调用中传递。
 func (s *XiaohongshuService) ConsumerVerifyOTP(otp string) (*ConsumerVerifyOTPResult, error) {
+	s.loginFlowMu.Lock()
+	defer s.loginFlowMu.Unlock()
+
 	if s.consumerLoginPage == nil || s.consumerLoginBrowser == nil {
 		return nil, fmt.Errorf("请先调用 consumer_phone_login 发送验证码")
 	}
@@ -762,6 +787,9 @@ func (s *XiaohongshuService) ConsumerVerifyOTP(otp string) (*ConsumerVerifyOTPRe
 
 // ConsumerCompleteSecurityVerification 完成 www 消费端手机号登录的二次验证。
 func (s *XiaohongshuService) ConsumerCompleteSecurityVerification() (*ConsumerVerifyOTPResult, error) {
+	s.loginFlowMu.Lock()
+	defer s.loginFlowMu.Unlock()
+
 	if s.consumerLoginPage == nil || s.consumerLoginBrowser == nil {
 		return nil, fmt.Errorf("没有活跃的 consumer 登录会话，请先调用 consumer_phone_login 和 consumer_verify_otp")
 	}

@@ -1098,3 +1098,60 @@ func (s *AppServer) handleConsumerCompleteSecurityVerification(ctx context.Conte
 		Content: []MCPContent{{Type: "text", Text: "consumer 登录成功，www session 已通过正向页面验收并保存。"}},
 	}
 }
+
+// handleConsumerQRLogin opens one persistent consumer QR login flow and
+// returns the decoded PNG as MCP image content. The data URL never appears in
+// text output or logs.
+func (s *AppServer) handleConsumerQRLogin(ctx context.Context) *MCPToolResult {
+	logrus.Info("MCP: consumer 普通二维码登录")
+
+	result, err := s.xiaohongshuService.ConsumerQRLogin(ctx)
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "status=failed\nconsumer_qr_login 失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+	if result == nil || result.Status != consumerQRStatusReady || len(result.Image) == 0 {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "status=failed\nconsumer_qr_login 未返回有效二维码"}},
+			IsError: true,
+		}
+	}
+	return &MCPToolResult{
+		Content: []MCPContent{
+			{Type: "text", Text: "status=qr_ready\n二维码已准备，请使用小红书 App 扫码并在手机确认。"},
+			{Type: "image", MimeType: "image/png", Data: encodeBase64(result.Image)},
+		},
+	}
+}
+
+// handleConsumerCompleteQRLogin waits for the retained QR browser/page and
+// makes success conditional on the existing consumer finalizer.
+func (s *AppServer) handleConsumerCompleteQRLogin(ctx context.Context) *MCPToolResult {
+	logrus.Info("MCP: consumer 完成普通二维码登录")
+
+	result, err := s.xiaohongshuService.ConsumerCompleteQRLogin(ctx)
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "status=failed\nconsumer_complete_qr_login 失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+	if result == nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "status=failed\nconsumer_complete_qr_login 未返回明确状态"}},
+			IsError: true,
+		}
+	}
+	switch result.Status {
+	case consumerQRStatusSuccess:
+		return &MCPToolResult{Content: []MCPContent{{Type: "text", Text: "status=success\nconsumer 登录成功，已通过 consumer-specific 正向页面验收并保存 profile 及 cookies。"}}}
+	case consumerQRStatusExpired:
+		return &MCPToolResult{Content: []MCPContent{{Type: "text", Text: "status=expired\nconsumer 登录二维码已过期；pending browser/page 已清理，不会自动刷新。"}}, IsError: true}
+	case consumerQRStatusTimeout:
+		return &MCPToolResult{Content: []MCPContent{{Type: "text", Text: "status=timeout\nconsumer QR 登录等待超时；pending browser/page 已清理，不会自动重试。"}}, IsError: true}
+	default:
+		return &MCPToolResult{Content: []MCPContent{{Type: "text", Text: "status=failed\nconsumer QR 登录返回未知状态"}}, IsError: true}
+	}
+}
