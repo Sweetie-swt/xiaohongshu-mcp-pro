@@ -70,3 +70,25 @@ func TestConsumerDiagnosticsRedactPhoneLikeNumbers(t *testing.T) {
 	require.Contains(t, message, "<digits-redacted>")
 	require.NotContains(t, strings.Join([]string{message}, ""), "15376356205")
 }
+
+func TestConsumerAgreementDOMDiagnosticIsReadOnlyAndStructural(t *testing.T) {
+	for _, fragment := range []string{
+		"我已阅读并同意",
+		"用户协议",
+		"隐私政策",
+		"隐私协议",
+		"隐私条款",
+		"服务条款",
+		"相关协议",
+		"elementsFromPoint",
+		"previousElementSibling",
+		"nextElementSibling",
+		"aria-checked",
+		"pointer_events",
+		"interactive_hint",
+	} {
+		require.Contains(t, consumerAgreementDOMDiagnosticScript, fragment)
+	}
+	require.NotContains(t, consumerAgreementDOMDiagnosticScript, "input.value")
+	require.NotContains(t, consumerAgreementDOMDiagnosticScript, ".click()")
+}

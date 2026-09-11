@@ -127,6 +127,14 @@ func (a *ConsumerLoginAction) SendOTP(phone string) (*OTPSendResult, error) {
 
 	agreement, agreementErr := a.ensureConsumerAgreementChecked()
 	a.logConsumerAgreementDiagnostics("协议处理后", agreement)
+	if agreement.Found == 0 {
+		candidateCount, diagnosticErr := a.logConsumerAgreementDOMDiagnostic()
+		message := fmt.Sprintf("consumer 协议诊断完成：未识别到协议控件，命中结构区域=%d；未点击获取验证码，未发送短信。", candidateCount)
+		if diagnosticErr != nil {
+			message += " DOM 诊断失败：" + diagnosticErr.Error()
+		}
+		return &OTPSendResult{Status: OTPSendFailed, Message: message}, errors.New("consumer 协议控件未识别，已进入 diagnostic-only 分支")
+	}
 	if agreementErr != nil {
 		shot, _ := pp.Screenshot(false, nil)
 		saveDebugShot("consumer-login-agreement-check", shot)
