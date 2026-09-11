@@ -289,18 +289,24 @@ func (t *consumerVerifyNetworkTrace) Snapshot() []consumerVerifyNetworkEvent {
 }
 
 func (t *consumerVerifyNetworkTrace) LogSnapshot(stage string, authGatePresent bool, authGateKind string) string {
+	return t.LogSnapshotWithSecurity(stage, authGatePresent, authGateKind, nil)
+}
+
+func (t *consumerVerifyNetworkTrace) LogSnapshotWithSecurity(stage string, authGatePresent bool, authGateKind string, securityNodes []consumerVerifySecurityNode) string {
 	if t == nil {
 		return consumerVerifyOutcomeRequestNotObserved
 	}
 	t.readWhitelistedResponseBodies()
 	events := t.Snapshot()
-	outcome := consumerVerifyNetworkOutcome(events, authGatePresent, authGateKind)
+	securityChallengeVisible := consumerVerifyVisibleSecurityChallenge(securityNodes)
+	redCaptchaEvidence := consumerVerifyRedCaptchaNetworkEvidence(events)
+	outcome := consumerVerifyNetworkOutcomeWithSecurityEvidence(events, authGatePresent, authGateKind, securityChallengeVisible)
 	encoded, err := json.Marshal(events)
 	if err != nil {
 		encoded = []byte("[]")
 	}
-	logrus.Infof("consumer VerifyOTP 网络诊断[%s]: outcome=%s events=%s",
-		stage, outcome, sanitizeConsumerVerifyNetworkLog(string(encoded)))
+	logrus.Infof("consumer VerifyOTP 网络诊断[%s]: outcome=%s security_challenge_visible=%t redcaptcha_network_evidence=%t events=%s",
+		stage, outcome, securityChallengeVisible, redCaptchaEvidence, sanitizeConsumerVerifyNetworkLog(string(encoded)))
 	return outcome
 }
 
@@ -436,9 +442,22 @@ func consumerVerifyResponseSignalsSuccess(event consumerVerifyNetworkEvent) bool
 }
 
 func consumerVerifyNetworkOutcome(events []consumerVerifyNetworkEvent, authGatePresent bool, authGateKind string) string {
-	if authGatePresent && authGateKind == "verification" {
+	return consumerVerifyNetworkOutcomeWithSecurityEvidence(events, authGatePresent, authGateKind, false)
+}
+
+func consumerVerifyNetworkOutcomeWithSecurityEvidence(events []consumerVerifyNetworkEvent, authGatePresent bool, authGateKind string, securityChallengeVisible bool) string {
+	// The captcha/security UI can appear after the login/code response. It is
+	// stronger than the underlying 4xx/5xx transport status and must win even
+	// when the original login modal remains mounted underneath it.
+	if authGatePresent && authGateKind == "verification" ||
+		securityChallengeVisible || consumerVerifyRedCaptchaNetworkEvidence(events) {
 		return consumerVerifyOutcomeSecurityVerification
 	}
+
+	return consumerVerifyNetworkOutcomeWithoutSecurityEvidence(events, authGatePresent, authGateKind)
+}
+
+func consumerVerifyNetworkOutcomeWithoutSecurityEvidence(events []consumerVerifyNetworkEvent, authGatePresent bool, authGateKind string) string {
 	loginEvents := make([]consumerVerifyNetworkEvent, 0, len(events))
 	for _, event := range events {
 		if consumerVerifyLoginRequestObserved(event) {
@@ -467,6 +486,43 @@ func consumerVerifyNetworkOutcome(events []consumerVerifyNetworkEvent, authGateP
 		}
 	}
 	return consumerVerifyOutcomeDiagnosticInconclusive
+}
+
+func consumerVerifyVisibleSecurityChallenge(nodes []consumerVerifySecurityNode) bool {
+	for _, node := range nodes {
+		if strings.EqualFold(strings.TrimSpace(node.Visibility), "hidden") {
+			continue
+		}
+		semantic := strings.ToLower(strings.TrimSpace(node.ID + " " + node.Class))
+		if strings.Contains(semantic, "captcha") ||
+			strings.Contains(semantic, "verification") ||
+			strings.Contains(semantic, "security") ||
+			strings.Contains(semantic, "risk") {
+			return true
+		}
+	}
+	return false
+}
+
+func consumerVerifyRedCaptchaNetworkEvidence(events []consumerVerifyNetworkEvent) bool {
+	for _, event := range events {
+		if event.ResourceType != string(proto.NetworkResourceTypeXHR) && event.ResourceType != string(proto.NetworkResourceTypeFetch) {
+			continue
+		}
+		safeURL, ok := consumerVerifySafeXHSURL(event.URL)
+		if !ok {
+			continue
+		}
+		parsed, err := url.Parse(safeURL)
+		if err != nil {
+			continue
+		}
+		path := strings.ToLower(parsed.EscapedPath())
+		if strings.Contains(path, "/api/redcaptcha/") {
+			return true
+		}
+	}
+	return false
 }
 
 func consumerVerifyLoginRequestObserved(event consumerVerifyNetworkEvent) bool {

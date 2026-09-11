@@ -360,53 +360,76 @@ func (a *ConsumerLoginAction) VerifyOTP(otp string) (*OTPVerificationResult, err
 	defer networkTrace.Stop()
 	networkTrace.Arm()
 	clickErr := loginButton.Click(proto.InputMouseButtonLeft, 1)
+	afterClickSecurityNodes := a.readConsumerVerifySecurityNodes()
 	afterClick := a.collectConsumerVerifyOTPDiagnostics()
 	afterClick.LoginClickDispatched = clickErr == nil
 	afterClick.ButtonStateChanged = consumerVerifyOTPButtonStateChanged(afterInput, afterClick)
 	a.logConsumerVerifyOTPDiagnostics("点击登录后立即", afterClick)
 	a.logConsumerVerifyDOMTextDiff("点击登录后立即", beforeModalText, a.readConsumerVerifyDOMTextSnapshot())
-	a.logConsumerVerifySecurityNodes("点击登录后立即", beforeSecurityNodes, a.readConsumerVerifySecurityNodes())
-	networkTrace.LogSnapshot("点击登录后立即", afterClick.AuthGatePresent, afterClick.AuthGateKind)
+	a.logConsumerVerifySecurityNodes("点击登录后立即", beforeSecurityNodes, afterClickSecurityNodes)
+	networkTrace.LogSnapshotWithSecurity("点击登录后立即", afterClick.AuthGatePresent, afterClick.AuthGateKind, afterClickSecurityNodes)
 	if clickErr != nil {
 		return nil, errors.Wrap(clickErr, "点击 consumer 登录按钮失败")
 	}
+	if consumerVerifyVisibleSecurityChallenge(afterClickSecurityNodes) || afterClick.AuthGateKind == "verification" {
+		shot, shotErr := a.page.Screenshot(false, nil)
+		if shotErr != nil {
+			logrus.Warnf("consumer 安全验证弹窗截图失败: %v", shotErr)
+		}
+		return &OTPVerificationResult{Status: OTPVerificationSecurityVerificationNeeded, SecurityVerificationQR: shot}, nil
+	}
 
 	time.Sleep(1 * time.Second)
+	afterOneSecondSecurityNodes := a.readConsumerVerifySecurityNodes()
 	afterOneSecond := a.collectConsumerVerifyOTPDiagnostics()
 	afterOneSecond.LoginClickDispatched = true
 	afterOneSecond.ButtonStateChanged = consumerVerifyOTPButtonStateChanged(afterInput, afterOneSecond)
 	a.logConsumerVerifyOTPDiagnostics("点击登录后约 1 秒", afterOneSecond)
 	a.logConsumerVerifyDOMTextDiff("点击登录后约 1 秒", beforeModalText, a.readConsumerVerifyDOMTextSnapshot())
-	a.logConsumerVerifySecurityNodes("点击登录后约 1 秒", beforeSecurityNodes, a.readConsumerVerifySecurityNodes())
-	networkTrace.LogSnapshot("点击登录后约 1 秒", afterOneSecond.AuthGatePresent, afterOneSecond.AuthGateKind)
-	time.Sleep(2 * time.Second)
-
-	if gate, gateErr := ReadConsumerAuthGate(a.page); gateErr == nil && gate.Present && gate.Kind == "verification" {
-		final := a.collectConsumerVerifyOTPDiagnostics()
-		final.LoginClickDispatched = true
-		final.ButtonStateChanged = consumerVerifyOTPButtonStateChanged(afterInput, final)
-		a.logConsumerVerifyOTPDiagnostics("最终判定前", final)
-		a.logConsumerVerifyDOMTextDiff("最终判定前", beforeModalText, a.readConsumerVerifyDOMTextSnapshot())
-		a.logConsumerVerifySecurityNodes("最终判定前", beforeSecurityNodes, a.readConsumerVerifySecurityNodes())
-		networkTrace.LogSnapshot("最终判定前", final.AuthGatePresent, final.AuthGateKind)
+	a.logConsumerVerifySecurityNodes("点击登录后约 1 秒", beforeSecurityNodes, afterOneSecondSecurityNodes)
+	networkTrace.LogSnapshotWithSecurity("点击登录后约 1 秒", afterOneSecond.AuthGatePresent, afterOneSecond.AuthGateKind, afterOneSecondSecurityNodes)
+	if consumerVerifyVisibleSecurityChallenge(afterOneSecondSecurityNodes) || afterOneSecond.AuthGateKind == "verification" {
 		shot, shotErr := a.page.Screenshot(false, nil)
 		if shotErr != nil {
 			logrus.Warnf("consumer 安全验证弹窗截图失败: %v", shotErr)
 		}
-		return &OTPVerificationResult{
-			Status:                 OTPVerificationSecurityVerificationNeeded,
-			SecurityVerificationQR: shot,
-		}, nil
+		return &OTPVerificationResult{Status: OTPVerificationSecurityVerificationNeeded, SecurityVerificationQR: shot}, nil
+	}
+	time.Sleep(2 * time.Second)
+
+	preEvidenceSecurityNodes := a.readConsumerVerifySecurityNodes()
+	preEvidence := a.collectConsumerVerifyOTPDiagnostics()
+	preEvidence.LoginClickDispatched = true
+	preEvidence.ButtonStateChanged = consumerVerifyOTPButtonStateChanged(afterInput, preEvidence)
+	a.logConsumerVerifyOTPDiagnostics("点击登录后约 3 秒", preEvidence)
+	a.logConsumerVerifyDOMTextDiff("点击登录后约 3 秒", beforeModalText, a.readConsumerVerifyDOMTextSnapshot())
+	a.logConsumerVerifySecurityNodes("点击登录后约 3 秒", beforeSecurityNodes, preEvidenceSecurityNodes)
+	networkTrace.LogSnapshotWithSecurity("点击登录后约 3 秒", preEvidence.AuthGatePresent, preEvidence.AuthGateKind, preEvidenceSecurityNodes)
+	if consumerVerifyVisibleSecurityChallenge(preEvidenceSecurityNodes) || preEvidence.AuthGateKind == "verification" {
+		shot, shotErr := a.page.Screenshot(false, nil)
+		if shotErr != nil {
+			logrus.Warnf("consumer 安全验证弹窗截图失败: %v", shotErr)
+		}
+		return &OTPVerificationResult{Status: OTPVerificationSecurityVerificationNeeded, SecurityVerificationQR: shot}, nil
 	}
 
 	evidence, evidenceErr := WaitForConsumerLoginEvidence(a.page, 5*time.Second)
+	finalSecurityNodes := a.readConsumerVerifySecurityNodes()
 	final := a.collectConsumerVerifyOTPDiagnostics()
 	final.LoginClickDispatched = true
 	final.ButtonStateChanged = consumerVerifyOTPButtonStateChanged(afterInput, final)
 	a.logConsumerVerifyOTPDiagnostics("最终判定前", final)
 	a.logConsumerVerifyDOMTextDiff("最终判定前", beforeModalText, a.readConsumerVerifyDOMTextSnapshot())
-	a.logConsumerVerifySecurityNodes("最终判定前", beforeSecurityNodes, a.readConsumerVerifySecurityNodes())
-	networkOutcome := networkTrace.LogSnapshot("最终判定前", final.AuthGatePresent, final.AuthGateKind)
+	a.logConsumerVerifySecurityNodes("最终判定前", beforeSecurityNodes, finalSecurityNodes)
+	networkOutcome := networkTrace.LogSnapshotWithSecurity("最终判定前", final.AuthGatePresent, final.AuthGateKind, finalSecurityNodes)
+	if consumerVerifyVisibleSecurityChallenge(finalSecurityNodes) ||
+		final.AuthGateKind == "verification" || consumerVerifyRedCaptchaNetworkEvidence(networkTrace.Snapshot()) {
+		shot, shotErr := a.page.Screenshot(false, nil)
+		if shotErr != nil {
+			logrus.Warnf("consumer 安全验证弹窗截图失败: %v", shotErr)
+		}
+		return &OTPVerificationResult{Status: OTPVerificationSecurityVerificationNeeded, SecurityVerificationQR: shot}, nil
+	}
 	if reason := consumerVerifyOTPFailureReason(final.VisibleMessages); reason != "" {
 		return nil, errors.New("consumer 验证码验证失败：" + reason)
 	}

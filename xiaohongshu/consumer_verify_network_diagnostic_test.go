@@ -133,6 +133,125 @@ func TestConsumerVerifyNetworkOutcomeClassification(t *testing.T) {
 	}
 }
 
+func TestConsumerVerifySecurityEvidenceOverridesTransportFailure(t *testing.T) {
+	events := []consumerVerifyNetworkEvent{
+		{
+			Method:           "POST",
+			URL:              "https://edith.xiaohongshu.com/api/sns/web/v2/login/code",
+			ResourceType:     string(proto.NetworkResourceTypeXHR),
+			RequestSent:      true,
+			ResponseReceived: true,
+			Status:           471,
+		},
+		{
+			Method:           "POST",
+			URL:              "https://edith.xiaohongshu.com/api/redcaptcha/v2/qr/init",
+			ResourceType:     string(proto.NetworkResourceTypeFetch),
+			RequestSent:      true,
+			ResponseReceived: true,
+			Status:           200,
+		},
+		{
+			Method:           "POST",
+			URL:              "https://edith.xiaohongshu.com/api/redcaptcha/v2/web/log",
+			ResourceType:     string(proto.NetworkResourceTypeXHR),
+			RequestSent:      true,
+			ResponseReceived: true,
+			Status:           200,
+		},
+	}
+	nodes := []consumerVerifySecurityNode{{
+		Tag:        "div",
+		Class:      "r-captcha-modal theme-dark",
+		Visibility: "visible",
+	}}
+	require.True(t, consumerVerifyVisibleSecurityChallenge(nodes))
+	require.True(t, consumerVerifyRedCaptchaNetworkEvidence(events))
+	require.Equal(t, consumerVerifyOutcomeSecurityVerification,
+		consumerVerifyNetworkOutcomeWithSecurityEvidence(events, true, "login", true))
+}
+
+func TestConsumerVerifyOrdinaryHTTPFailureWithoutSecurityEvidenceRemainsTransport(t *testing.T) {
+	events := []consumerVerifyNetworkEvent{{
+		Method:           "POST",
+		URL:              "https://edith.xiaohongshu.com/api/sns/web/v2/login/code",
+		ResourceType:     string(proto.NetworkResourceTypeXHR),
+		RequestSent:      true,
+		ResponseReceived: true,
+		Status:           503,
+	}}
+	require.False(t, consumerVerifyRedCaptchaNetworkEvidence(events))
+	require.Equal(t, consumerVerifyOutcomeTransportFailed,
+		consumerVerifyNetworkOutcomeWithSecurityEvidence(events, true, "login", false))
+}
+
+func TestConsumerVerifyHTTP471AloneDoesNotImplySecurity(t *testing.T) {
+	events := []consumerVerifyNetworkEvent{{
+		Method:           "POST",
+		URL:              "https://edith.xiaohongshu.com/api/sns/web/v2/login/code",
+		ResourceType:     string(proto.NetworkResourceTypeXHR),
+		RequestSent:      true,
+		ResponseReceived: true,
+		Status:           471,
+	}}
+	require.Equal(t, consumerVerifyOutcomeTransportFailed,
+		consumerVerifyNetworkOutcomeWithSecurityEvidence(events, true, "login", false))
+}
+
+func TestConsumerVerifyRedCaptchaNetworkEvidenceCanClassifyWithoutDOMSnapshot(t *testing.T) {
+	events := []consumerVerifyNetworkEvent{
+		{
+			URL:              "https://edith.xiaohongshu.com/api/sns/web/v2/login/code",
+			ResourceType:     string(proto.NetworkResourceTypeXHR),
+			RequestSent:      true,
+			ResponseReceived: true,
+			Status:           471,
+		},
+		{
+			URL:              "https://edith.xiaohongshu.com/api/redcaptcha/v2/qr/init?opaque=secret",
+			ResourceType:     string(proto.NetworkResourceTypeXHR),
+			RequestSent:      true,
+			ResponseReceived: true,
+			Status:           200,
+		},
+	}
+	require.Equal(t, consumerVerifyOutcomeSecurityVerification,
+		consumerVerifyNetworkOutcomeWithSecurityEvidence(events, true, "login", false))
+}
+
+func TestConsumerVerifyCaptchaWinsOverBackgroundLoginModal(t *testing.T) {
+	events := []consumerVerifyNetworkEvent{{
+		Method:           "POST",
+		URL:              "https://edith.xiaohongshu.com/api/sns/web/v2/login/code",
+		ResourceType:     string(proto.NetworkResourceTypeXHR),
+		RequestSent:      true,
+		ResponseReceived: true,
+		Status:           471,
+	}}
+	nodes := []consumerVerifySecurityNode{
+		{Tag: "div", Class: "reds-modal login-modal", Visibility: "visible"},
+		{Tag: "div", Class: "r-captcha-modal theme-dark", Visibility: "visible"},
+	}
+	require.True(t, consumerVerifyVisibleSecurityChallenge(nodes))
+	require.Equal(t, consumerVerifyOutcomeSecurityVerification,
+		consumerVerifyNetworkOutcomeWithSecurityEvidence(events, true, "login", true))
+}
+
+func TestConsumerVerifySecurityEvidenceRequiresExplicitSemanticNodeOrRedCaptcha(t *testing.T) {
+	require.False(t, consumerVerifyVisibleSecurityChallenge([]consumerVerifySecurityNode{{
+		Tag: "iframe", Visibility: "visible",
+	}}))
+	require.False(t, consumerVerifyVisibleSecurityChallenge([]consumerVerifySecurityNode{{
+		Tag: "div", Class: "captcha-modal", Visibility: "hidden",
+	}}))
+	require.False(t, consumerVerifyRedCaptchaNetworkEvidence([]consumerVerifyNetworkEvent{{
+		URL:          "https://edith.xiaohongshu.com/api/sns/web/v2/login/code",
+		ResourceType: string(proto.NetworkResourceTypeXHR),
+		RequestSent:  true,
+		Status:       471,
+	}}))
+}
+
 func TestConsumerVerifyLoginResponseCandidateIsStrict(t *testing.T) {
 	require.True(t, consumerVerifyLoginResponseCandidate(consumerVerifyNetworkEvent{
 		URL:          "https://www.xiaohongshu.com/api/sns/web/v1/login",

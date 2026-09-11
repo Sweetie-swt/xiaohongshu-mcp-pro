@@ -111,9 +111,22 @@ func TestConsumerVerifyOTPDiagnosticStagesAreWired(t *testing.T) {
 	}
 	require.Contains(t, source, "loginButton.Click(proto.InputMouseButtonLeft, 1)")
 	require.Contains(t, source, "networkTrace.Start(context.Background())")
-	require.Contains(t, source, "networkTrace.LogSnapshot(\"点击登录后立即\"")
-	require.Contains(t, source, "networkTrace.LogSnapshot(\"点击登录后约 1 秒\"")
-	require.Contains(t, source, "networkTrace.LogSnapshot(\"最终判定前\"")
+	require.Contains(t, source, "networkTrace.LogSnapshotWithSecurity(\"点击登录后立即\"")
+	require.Contains(t, source, "networkTrace.LogSnapshotWithSecurity(\"点击登录后约 1 秒\"")
+	require.Contains(t, source, "networkTrace.LogSnapshotWithSecurity(\"最终判定前\"")
+}
+
+func TestConsumerVerifySecurityResultKeepsScreenshotReturnPath(t *testing.T) {
+	source := string(mustReadConsumerVerifySource(t))
+	require.Contains(t, source, "OTPVerificationSecurityVerificationNeeded")
+	require.Contains(t, source, "a.page.Screenshot(false, nil)")
+	require.Contains(t, source, "SecurityVerificationQR: shot")
+	securityBranch := strings.Index(source, "consumerVerifyVisibleSecurityChallenge(finalSecurityNodes)")
+	normalErrorBranch := strings.Index(source, "networkOutcome == consumerVerifyOutcomeTransportFailed")
+	require.NotEqual(t, -1, securityBranch)
+	require.NotEqual(t, -1, normalErrorBranch)
+	require.Less(t, securityBranch, normalErrorBranch,
+		"security verification must be returned before ordinary network errors")
 }
 
 func mustReadConsumerVerifySource(t *testing.T) []byte {
