@@ -33,6 +33,7 @@ from creator_verify_otp_local import (
 
 
 PHONE_PATTERN = re.compile(r"1[3-9]\d{9}")
+CONSUMER_FINALIZER_REQUEST_TIMEOUT_SECONDS = 135
 
 
 def is_valid_phone(phone: str) -> bool:
@@ -103,7 +104,9 @@ def run_consumer_flow() -> int:
             print("请用手机完成小红书安全验证；完成后回到此终端按 Enter。")
             input("已完成安全验证后按 Enter 继续：")
             complete_message = call_complete_security_verification(
-                session_id, CONSUMER_FLOW
+                session_id,
+                CONSUMER_FLOW,
+                timeout_seconds=CONSUMER_FINALIZER_REQUEST_TIMEOUT_SECONDS,
             )
             print_tool_result(complete_message, otp, redact_values=(phone,))
             complete_is_error, _, _ = tool_result_parts(complete_message)
